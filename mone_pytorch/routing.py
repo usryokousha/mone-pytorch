@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -71,78 +72,51 @@ class ExpertPreferredRouter(nn.Module):
         return probs
 
     def forward(self, input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Compute router probabilities and token assignments without looping over the batch,
-        and without cloning the router probabilities.
-        """
-        batch, num_tokens, dim = input_tokens.shape
-        # Compute router probabilities
-        router_probs = self._compute_router_probabilities(input_tokens)
+            batch_size, num_tokens, dim = input_tokens.shape
+            device = input_tokens.device
+            router_probs = self._compute_router_probabilities(input_tokens)
 
-        # Compute token capacities
-        k = (self.capacity_distribution * num_tokens).floor().long()
+            # Compute token capacities for each expert
+            k = (self.capacity_distribution * num_tokens).floor().long()  # [num_experts]
 
-        # Initialize token assignments with -1 (unassigned)
-        token_mask = torch.full(
-            (batch, num_tokens), -1, dtype=torch.long, device=input_tokens.device
-        )
-        unassigned_mask = torch.ones(
-            (batch, num_tokens), dtype=torch.bool, device=input_tokens.device
-        )
-
-        for j in range(self.num_experts - 1, -1, -1):
-            # Compute the number of unassigned tokens per batch item
-            num_unassigned = unassigned_mask.sum(dim=1)  # Shape: [batch]
-            k_j = k[j].unsqueeze(0).expand(batch)  # Shape: [batch]
-            k_i = torch.minimum(k_j, num_unassigned)  # Shape: [batch]
-
-            if k_i.sum() == 0:
-                continue
-
-            # Extract router probabilities for expert j
-            r_j = router_probs[:, :, j]  # Shape: [batch, num_tokens]
-
-            # Mask already assigned tokens
-            r_j = r_j.masked_fill(~unassigned_mask, float("-inf"))
-
-            # Get sorted indices of router probabilities
-            _, sorted_indices = torch.sort(
-                r_j, dim=1, descending=True
-            )  # Shape: [batch, num_tokens]
-
-            # Create a range tensor for indices
-            range_tensor = (
-                torch.arange(num_tokens, device=input_tokens.device)
-                .unsqueeze(0)
-                .expand(batch, -1)
+            # Initialize token assignments with -1 (unassigned)
+            token_mask = torch.full(
+                (batch_size, num_tokens), -1, dtype=torch.long, device=device
+            )
+            unassigned_mask = torch.ones(
+                (batch_size, num_tokens), dtype=torch.bool, device=device
             )
 
-            # Create a mask for selecting top k_i tokens per batch item
-            k_i_expanded = k_i.unsqueeze(1)  # Shape: [batch, 1]
-            top_k_mask = range_tensor < k_i_expanded  # Shape: [batch, num_tokens], bool
+            # For each expert, assign tokens
+            for j in reversed(range(self.num_experts)):
+                # Check if any capacity is left for this expert
+                capacity = k[j]
+                if capacity == 0:
+                    continue
 
-            # Select the indices to assign
-            selected_indices = sorted_indices[
-                top_k_mask
-            ]  # 1D tensor of selected token indices
-            selected_batch_indices = (
-                torch.arange(batch, device=input_tokens.device)
-                .unsqueeze(1)
-                .expand(-1, num_tokens)[top_k_mask]
-            )
+                # Get the router probabilities for expert j
+                r_j = router_probs[:, :, j]  # [batch_size, num_tokens]
 
-            # Assign to token_mask
-            token_mask[selected_batch_indices, selected_indices] = j
+                # Mask already assigned tokens
+                r_j = r_j.masked_fill(~unassigned_mask, float('-inf'))
 
-            # Update unassigned_mask
-            unassigned_mask[selected_batch_indices, selected_indices] = False
+                # Get the top-k tokens for this expert
+                _, topk_indices = torch.topk(r_j, capacity, dim=1)
 
-        # Assign any remaining unassigned tokens to expert 0
-        token_mask[token_mask == -1] = 0
+                # Assign tokens to the expert
+                batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+                token_mask[batch_indices, topk_indices] = j
 
-        return token_mask, torch.gather(
-            router_probs, 2, token_mask.unsqueeze(-1)
-        ).squeeze(-1)
+                # Update unassigned mask
+                unassigned_mask[batch_indices, topk_indices] = False
+
+            # Assign any remaining unassigned tokens to expert 0
+            token_mask[token_mask == -1] = 0
+
+            # Gather the router probabilities corresponding to the assigned experts
+            assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
+
+            return token_mask, assigned_probs
 
 
 class Combine(nn.Module):
@@ -238,23 +212,33 @@ def compute_capacity_distribution(e_c, E, delta=2, beta=10):
     return c
 
 
+def benchmark(router, input_tokens):
+    start_time = time.time()
+    token_mask, assigned_probs = router(input_tokens)
+    torch.cuda.synchronize()  # Ensure all CUDA operations are finished
+    end_time = time.time()
+    return end_time - start_time
+
 # Define input tokens
-batch_size = 2
-num_tokens = 10
-dim = 16
-input_tokens = torch.randn(batch_size, num_tokens, dim)
+batch_size = 32
+num_tokens = 100
+dim = 128
+input_tokens = torch.randn(batch_size, num_tokens, dim).cuda()
 
 # Define capacity distribution
 capacity_distribution = [0.2, 0.3, 0.5]  # Sum must be 1.0
 
 # Initialize router
-router = ExpertPreferredRouter(dim=dim, capacity_distribution=capacity_distribution)
+router = ExpertPreferredRouter(dim=dim, capacity_distribution=capacity_distribution).cuda()
 
 # Forward pass
 token_mask, router_probs = router(input_tokens)
 
-print("Token Mask:", token_mask)
-print("Router Probabilities:", router_probs)
+print("Token Mask:", token_mask.cpu())
+print("Router Probabilities:", router_probs.cpu())
+
+# benchmark
+print(f"Execution time: {benchmark(router, input_tokens):.6f} seconds")
 
 # Parameters
 e_c = 0.6  # Effective capacity (between 0 and 1)

@@ -19,7 +19,7 @@ def linear_expert_fwd_kernel(
 
     exponent = num_experts - m
     D_m = (in_features >> exponent) if expert_expansion else (out_features >> exponent)
-    D_m = tl.max(D_m, 1)
+    D_m = max(D_m, 1)
 
     x_offset = idx * in_features
     x_i = tl.load(
@@ -46,7 +46,7 @@ def linear_expert_fwd_kernel(
         y_i = tl.dot(x_i.to(tl.float32), w_m) + b_m
         padding = out_dim - D_m
         if padding > 0:
-            y_i = tl.concat([y_i, tl.zeros((padding,), dtype=y_i.dtype)])
+            y_i = tl.cat([y_i, tl.zeros((padding,), dtype=y_i.dtype)])
 
     output_offset = idx * out_dim
     tl.store(
@@ -74,7 +74,7 @@ def linear_expert_bwd_kernel(
 
     exponent = num_experts - m
     D_m = (in_features >> exponent) if expert_expansion else (out_features >> exponent)
-    D_m = tl.max(D_m, 1)
+    D_m = max(D_m, 1)
 
     x_offset = idx * in_features
     x_i = tl.load(

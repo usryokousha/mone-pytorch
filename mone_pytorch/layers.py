@@ -1,12 +1,11 @@
 
 import os
+import time
 import warnings
 from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from mone_pytorch.ops.nested_linear_triton import linear_expert
 
 from typing import List
 
@@ -72,17 +71,15 @@ class NestedLinear(nn.Linear):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, out_features).
         """
-        if torch.cuda.is_available():
-            return linear_expert(x, self.weight, self.bias, token_mask, self.num_experts, self.expert_expansion, self.in_features, self.out_features)
+    
+        if self.expert_expansion:
+            return linear_expert_expansion(
+                x, self.weight, self.bias, token_mask, self.num_experts
+            )
         else:
-            if self.expert_expansion:
-                return linear_expert_expansion(
-                    x, self.weight, self.bias, token_mask, self.num_experts
-                )
-            else:
-                return linear_expert_contraction(
-                    x, self.weight, self.bias, token_mask, self.num_experts
-                )
+            return linear_expert_contraction(
+                x, self.weight, self.bias, token_mask, self.num_experts
+            )
 
 
 def linear_expert_expansion(
@@ -240,25 +237,38 @@ def remove_padding(x: torch.Tensor, num_experts: int, token_mask: torch.Tensor) 
 
 # Test the layers
 num_experts = 4
-in_features = 16
-out_features = 16
+in_features = 32
+out_features = 32
 
+x = torch.randn(1, 10, in_features).cuda()
+token_mask = torch.randint(1, num_experts, (1, 10)).cuda()
 
-
-x = torch.randn(1, 10, in_features)
-token_mask = torch.randint(1, num_experts, (1, 10))
-
-linear_expansion = NestedLinear(in_features, out_features, num_experts, expert_expansion=True)
+linear_expansion = NestedLinear(in_features, out_features, num_experts, expert_expansion=True).cuda()
 y_expansion = linear_expansion(x, token_mask)
-print("x:", x)
-print("y_expansion:", y_expansion)
+print("x:", x.cpu())
+print("y_expansion:", y_expansion.cpu())
 print("all tokens are assigned to an expert:", torch.all(y_expansion != 0.))
 
-linear_contraction = NestedLinear(in_features, out_features, num_experts, expert_expansion=False)
+linear_contraction = NestedLinear(in_features, out_features, num_experts, expert_expansion=False).cuda()
 y_contraction = linear_contraction(x, token_mask)
-print("y_contraction:", y_contraction)
+print("y_contraction:", y_contraction.cpu())
 print("all tokens are assigned to an expert:", torch.all(y_contraction != 0.))
 y_contraction_unpad = remove_padding(y_contraction, num_experts, token_mask)
 print("Shape of each unpadded output:", [y_i.shape for y_i in y_contraction_unpad])
 
+def benchmark_nested_linear(linear_expansion, input_tokens, token_mask):
+    start_time = time.time()
+    linear_expansion(input_tokens, token_mask)
+    torch.cuda.synchronize()  # Ensure all CUDA operations are finished
+    end_time = time.time()
+    return end_time - start_time
 
+def benchmark_default_linear(input_tokens, weight, bias):
+    start_time = time.time()
+    F.linear(input_tokens, weight, bias)
+    torch.cuda.synchronize()  # Ensure all CUDA operations are finished
+    end_time = time.time()
+    return end_time - start_time
+
+print(f"Execution time: {benchmark_nested_linear(linear_expansion, x, token_mask):.6f} seconds")
+print(f"Execution time: {benchmark_default_linear(x, linear_expansion.weight, linear_expansion.bias):.6f} seconds")
