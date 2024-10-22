@@ -2,12 +2,9 @@
 import os
 import time
 import warnings
-from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from typing import List
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
@@ -263,12 +260,12 @@ def benchmark_nested_linear(linear_expansion, input_tokens, token_mask):
     end_time = time.time()
     return end_time - start_time
 
-def benchmark_default_linear(input_tokens, weight, bias):
+def benchmark_default_linear(input_tokens):
     start_time = time.time()
-    F.linear(input_tokens, weight, bias)
+    F.linear(input_tokens)
     torch.cuda.synchronize()  # Ensure all CUDA operations are finished
     end_time = time.time()
     return end_time - start_time
 
 print(f"Execution time: {benchmark_nested_linear(linear_expansion, x, token_mask):.6f} seconds")
-print(f"Execution time: {benchmark_default_linear(x, linear_expansion.weight, linear_expansion.bias):.6f} seconds")
+print(f"Ex ecution time: {benchmark_default_linear(x):.6f} seconds")
