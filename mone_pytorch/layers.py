@@ -1,10 +1,16 @@
-
 import os
-import time
 import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ops.nested_linear_triton import (
+    nested_linear_contract as nested_linear_contract_triton,
+)
+from ops.nested_linear_triton import (
+    nested_linear_expand as nested_linear_expand_triton,
+)
+
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
@@ -20,87 +26,80 @@ except ImportError:
     XFORMERS_AVAILABLE = False
     warnings.warn("xFormers is not available (Attention)")
 
-class NestedLinear(nn.Linear):
-    """
-    Nested Linear layer with token-wise expert assignment.
+CUDA_AVAILABLE = torch.cuda.is_available()
 
-    This layer extends the standard Linear layer to support multiple experts,
-    where each expert operates on a subset of the input or output features.
-    The expert assignment is determined by a token mask.
 
-    Args:
-        in_features (int): Size of each input sample.
-        out_features (int): Size of each output sample.
-        num_experts (int): Number of experts.
-        expert_expansion (bool, optional): If True, experts operate on input features.
-                                    If False, experts operate on output features.
-                                    Defaults to True.
-        bias (bool, optional): If set to False, the layer will not learn an additive bias.
-                               Defaults to True.
-        **kwargs: Additional arguments passed to nn.Linear.
-
-    Attributes:
-        num_experts (int): Number of experts.
-        expert_dim (List[int]): List of feature dimensions for each expert.
-
-    """
-
+class NestedLinearExpand(nn.Linear):
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        num_experts: int,
-        expert_expansion: bool = True,
         bias: bool = True,
-        **kwargs,
+        num_experts=4,
+        device=None,
+        dtype=None,
     ):
-        super().__init__(in_features, out_features, bias, **kwargs)
+        super().__init__(in_features, out_features, bias, device, dtype)
         self.num_experts = num_experts
-        self.expert_expansion = expert_expansion
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, in_features).
-            token_mask (torch.Tensor): Tensor of shape (batch_size, seq_len) containing
-                                       expert assignments for each token.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, out_features).
-        """
-    
-        if self.expert_expansion:
-            return linear_expert_expansion(
+        if CUDA_AVAILABLE:
+            return nested_linear_expand_triton(
                 x, self.weight, self.bias, token_mask, self.num_experts
             )
         else:
-            return linear_expert_contraction(
+            return nested_linear_expand(
                 x, self.weight, self.bias, token_mask, self.num_experts
             )
 
 
-def linear_expert_expansion(
+class NestedLinearContract(nn.Linear):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        num_experts=4,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(in_features, out_features, bias, device, dtype)
+        self.num_experts = num_experts
+
+    def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+        if CUDA_AVAILABLE:
+            return nested_linear_contract_triton(
+                x, self.weight, self.bias, token_mask, self.num_experts
+            )
+        else:
+            return nested_linear_contract(
+                x, self.weight, self.bias, token_mask, self.num_experts
+            )
+
+
+@torch.compile
+def nested_linear_expand(
     x: torch.Tensor,
     w: torch.Tensor,
     b: torch.Tensor,
     token_mask: torch.Tensor,
-    num_experts: int,
+    num_experts: int = 4,
 ) -> torch.Tensor:
     batch, seq_len, in_dim = x.shape
+    in_dim = w.shape[0]
     out_dim = w.shape[1]
     output = torch.zeros((batch * seq_len, in_dim), device=x.device, dtype=x.dtype)
     x = x.reshape(batch * seq_len, in_dim)
-    for m in range(1, num_experts + 1):
+    for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (token_mask == m).view(batch * seq_len)
         N_m = valid_mask.sum().item()
-        exponent = num_experts - m
 
         # skip if no tokens are assigned to the m-th expert
         if N_m == 0:
             continue
 
-        D_m = (in_dim >> exponent)
+        D_m = in_dim >> (num_experts - m - 1)
 
         # slice the input and weight
         x_m = x[valid_mask, :D_m]
@@ -112,18 +111,20 @@ def linear_expert_expansion(
     return output.reshape(batch, seq_len, out_dim)
 
 
-def linear_expert_contraction(
+@torch.compile
+def nested_linear_contract(
     x: torch.Tensor,
     w: torch.Tensor,
     b: torch.Tensor,
     token_mask: torch.Tensor,
-    num_experts: int,
+    num_experts: int = 4,
 ) -> torch.Tensor:
     batch, seq_len, in_dim = x.shape
+    in_dim = w.shape[0]
     out_dim = w.shape[0]
     output = torch.zeros((batch * seq_len, out_dim), device=x.device, dtype=x.dtype)
     x = x.reshape(batch * seq_len, in_dim)
-    for m in range(1, num_experts + 1):
+    for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (token_mask == m).view(batch * seq_len)
         N_m = valid_mask.sum().item()
@@ -132,8 +133,7 @@ def linear_expert_contraction(
         if N_m == 0:
             continue
 
-        exponent = num_experts - m
-        D_m = (in_dim >> exponent)
+        D_m = out_dim >> (num_experts - m - 1)
 
         # slice the input and weight
         x_m = x[valid_mask]
@@ -150,57 +150,76 @@ def linear_expert_contraction(
 
     return output.reshape(batch, seq_len, out_dim)
 
+
 class NestedFeedForward(nn.Module):
     """
     Nested FeedForward layer with token-wise expert assignment.
     """
-    def __init__(self, in_features: int, num_experts: int, expansion_factor: int = 4, activation: nn.Module = nn.GELU()):
+
+    def __init__(
+        self,
+        dim: int,
+        expansion_factor: int = 4,
+        activation: nn.Module = nn.GELU(),
+        num_experts: int = 4,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.expansion_factor = expansion_factor
         self.activation = activation
-        self.proj1 = NestedLinear(in_features, in_features * expansion_factor, num_experts, expert_expansion=True)
-        self.proj2 = NestedLinear(in_features * expansion_factor, in_features, num_experts, expert_expansion=False)
+        self.proj1 = NestedLinearExpand(dim, dim * expansion_factor, num_experts)
+        self.proj2 = NestedLinearContract(dim * expansion_factor, dim, num_experts)
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
         x = self.proj1(x, token_mask)
         x = self.activation(x)
         x = self.proj2(x, token_mask)
         return x
-    
+
+
 class NestedAttention(nn.Module):
     """
     Nested Attention layer with token-wise expert assignment.
     """
+
     def __init__(
         self,
         dim: int,
         num_heads: int = 8,
+        num_experts: int = 4,
         qkv_bias: bool = False,
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        num_experts: int = 4,
     ) -> None:
         super().__init__()
-        self.num_experts = num_experts
+        self.dim = dim
+        self.num_experts = len(dim)
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        self.q = NestedLinear(dim, dim, num_experts, expert_expansion=True, bias=qkv_bias)
-        self.k = NestedLinear(dim, dim, num_experts, expert_expansion=True, bias=qkv_bias)
-        self.v = NestedLinear(dim, dim, num_experts, expert_expansion=True, bias=qkv_bias)
+        self.q = NestedLinearExpand(dim, dim, num_experts, bias=qkv_bias)
+        self.k = NestedLinearExpand(dim, dim, num_experts, bias=qkv_bias)
+        self.v = NestedLinearExpand(dim, dim, num_experts, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = NestedLinear(dim, dim, num_experts, expert_expansion=False, bias=proj_bias)
+        self.proj = NestedLinearContract(dim, dim, num_experts, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, input_tokens: torch.Tensor, token_mask: torch.Tensor, attn_bias=None) -> torch.Tensor:
-        B, N, C = input_tokens.shape
+    def forward(
+        self, input_tokens: torch.Tensor, token_mask: torch.Tensor, attn_bias=None
+    ) -> torch.Tensor:
+        B, N, _ = input_tokens.shape
 
-        q = self.q(input_tokens, token_mask).reshape(B, N, self.num_heads, C // self.num_heads)
-        k = self.k(input_tokens, token_mask).reshape(B, N, self.num_heads, C // self.num_heads)
-        v = self.v(input_tokens, token_mask).reshape(B, N, self.num_heads, C // self.num_heads)
+        q = self.q(input_tokens, token_mask).reshape(
+            B, N, self.num_heads, self.dim // self.num_heads
+        )
+        k = self.k(input_tokens, token_mask).reshape(
+            B, N, self.num_heads, self.dim // self.num_heads
+        )
+        v = self.v(input_tokens, token_mask).reshape(
+            B, N, self.num_heads, self.dim // self.num_heads
+        )
 
         if XFORMERS_AVAILABLE:
             x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
@@ -209,63 +228,8 @@ class NestedAttention(nn.Module):
                 raise ValueError("Only support xFormers for now")
             x = F.scaled_dot_product_attention(q, k, v)
 
-        x = x.reshape([B, N, C])
+        x = x.reshape([B, N, self.dim])
         x = self.proj(x, token_mask)
         x = self.proj_drop(x)
 
-        return x + input_tokens
-    
-
-def remove_padding(x: torch.Tensor, num_experts: int, token_mask: torch.Tensor) -> torch.Tensor:
-    batch, seq_len, in_dim = x.shape
-    expert_dim = [
-                x.shape[-1] // 2**i for i in reversed(range(num_experts))
-            ]
-    
-    x = x.reshape(batch * seq_len, in_dim)
-    output = []
-    for m in range(1, num_experts + 1):
-        valid_mask = (token_mask == m).view(batch * seq_len)
-        N_m = valid_mask.sum().item()
-        if N_m == 0:
-            continue
-        output.append(x[valid_mask, :expert_dim[m-1]].reshape(batch, N_m // batch, expert_dim[m-1]))
-    return output
-
-# Test the layers
-num_experts = 4
-in_features = 32
-out_features = 32
-
-x = torch.randn(1, 10, in_features).cuda()
-token_mask = torch.randint(1, num_experts, (1, 10)).cuda()
-
-linear_expansion = NestedLinear(in_features, out_features, num_experts, expert_expansion=True).cuda()
-y_expansion = linear_expansion(x, token_mask)
-print("x:", x.cpu())
-print("y_expansion:", y_expansion.cpu())
-print("all tokens are assigned to an expert:", torch.all(y_expansion != 0.))
-
-linear_contraction = NestedLinear(in_features, out_features, num_experts, expert_expansion=False).cuda()
-y_contraction = linear_contraction(x, token_mask)
-print("y_contraction:", y_contraction.cpu())
-print("all tokens are assigned to an expert:", torch.all(y_contraction != 0.))
-y_contraction_unpad = remove_padding(y_contraction, num_experts, token_mask)
-print("Shape of each unpadded output:", [y_i.shape for y_i in y_contraction_unpad])
-
-def benchmark_nested_linear(linear_expansion, input_tokens, token_mask):
-    start_time = time.time()
-    linear_expansion(input_tokens, token_mask)
-    torch.cuda.synchronize()  # Ensure all CUDA operations are finished
-    end_time = time.time()
-    return end_time - start_time
-
-def benchmark_default_linear(input_tokens):
-    start_time = time.time()
-    F.linear(input_tokens)
-    torch.cuda.synchronize()  # Ensure all CUDA operations are finished
-    end_time = time.time()
-    return end_time - start_time
-
-print(f"Execution time: {benchmark_nested_linear(linear_expansion, x, token_mask):.6f} seconds")
-print(f"Ex ecution time: {benchmark_default_linear(x):.6f} seconds")
+        return x
