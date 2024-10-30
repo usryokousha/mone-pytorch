@@ -119,14 +119,14 @@ class ExpertPreferredRouter(nn.Module):
         return token_mask, assigned_probs
 
 
-class Combine(nn.Module):
+class NestedCombine(nn.Module):
     """
     Combine the output of the experts.
     """
 
     def __init__(self, dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.alpha = nn.Parameter(torch.ones(1, dtype=dtype))
+        self.alpha = nn.Parameter(torch.zeros(1, dtype=dtype))
         self.dtype = dtype
 
     def forward(
