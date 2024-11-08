@@ -1,3 +1,6 @@
+# Code taking heavy inspiration from:
+#  https://github.com/gpu-mode/lectures
+#  https://github.com/Dao-AILab/flash-attention
 
 from torch.amp import custom_bwd, custom_fwd
 import torch
