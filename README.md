@@ -8,16 +8,6 @@ This repository contains a PyTorch implementation of the **Mixture of Nested Exp
 - **Nested Linear Projections**: Includes `NestedLinearExpand` and `NestedLinearContract`, implementing nested linear projections for flexible token processing. [Located in `mone_pytorch/layers.py`](mone_pytorch/layers.py)
 - **Optimized Triton Kernels**: Custom Triton kernels to support efficient nested linear projections. [See `mone_pytorch/ops/nested_linear_triton.py`](mone_pytorch/ops/nested_linear_triton.py)
 
-## Installation
-
-To run the code, clone this repository and install the required dependencies:
-
-```bash
-git clone <repository-url>
-cd mone-pytorch
-pip install -r requirements.txt
-```
-
 ## Usage
 
 ### 1. ExpertPreferredRouter

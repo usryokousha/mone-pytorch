@@ -26,7 +26,7 @@ except ImportError:
     XFORMERS_AVAILABLE = False
     warnings.warn("xFormers is not available (Attention)")
 
-CUDA_AVAILABLE = torch.cuda.is_available()
+CUDA_AVAILABLE = 0
 
 
 class NestedLinearExpand(nn.Linear):
@@ -51,6 +51,10 @@ class NestedLinearExpand(nn.Linear):
             return nested_linear_expand(
                 x, self.weight, self.bias, token_mask, self.num_experts
             )
+    def deterministic_init(self):
+        self.weight.data = torch.ones_like(self.weight.data)
+        if self.bias is not None:
+            self.bias.data = torch.zeros_like(self.bias.data)
 
 
 class NestedLinearContract(nn.Linear):
@@ -75,6 +79,11 @@ class NestedLinearContract(nn.Linear):
             return nested_linear_contract(
                 x, self.weight, self.bias, token_mask, self.num_experts
             )
+        
+    def deterministic_init(self):
+        self.weight.data = torch.ones_like(self.weight.data)
+        if self.bias is not None:
+            self.bias.data = torch.zeros_like(self.bias.data)
 
 
 @torch.compile
@@ -86,18 +95,18 @@ def nested_linear_expand(
     num_experts: int = 4,
 ) -> torch.Tensor:
     batch, seq_len, in_dim = x.shape
-    in_dim = w.shape[0]
-    out_dim = w.shape[1]
-    output = torch.zeros((batch * seq_len, in_dim), device=x.device, dtype=x.dtype)
+    in_dim = w.shape[1]
+    out_dim = w.shape[0]
+    output = torch.zeros((batch * seq_len, out_dim), device=x.device, dtype=x.dtype)
     x = x.reshape(batch * seq_len, in_dim)
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (token_mask == m).view(batch * seq_len)
-        N_m = valid_mask.sum().item()
+        # N_m = valid_mask.sum().item()
 
         # skip if no tokens are assigned to the m-th expert
-        if N_m == 0:
-            continue
+        # if N_m == 0:
+        #     continue
 
         D_m = in_dim >> (num_experts - m - 1)
 
@@ -120,22 +129,22 @@ def nested_linear_contract(
     num_experts: int = 4,
 ) -> torch.Tensor:
     batch, seq_len, in_dim = x.shape
-    in_dim = w.shape[0]
+    in_dim = w.shape[1]
     out_dim = w.shape[0]
     output = torch.zeros((batch * seq_len, out_dim), device=x.device, dtype=x.dtype)
     x = x.reshape(batch * seq_len, in_dim)
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (token_mask == m).view(batch * seq_len)
-        N_m = valid_mask.sum().item()
+        # N_m = valid_mask.sum().item()
 
         # skip if no tokens are assigned to the m-th expert
-        if N_m == 0:
-            continue
+        # if N_m == 0:
+        #     continue
 
         D_m = out_dim >> (num_experts - m - 1)
 
-        # slice the input and weight
+        # get the m-th expert's input and sliced weight
         x_m = x[valid_mask]
         w_m = w[:D_m, :]
 
@@ -144,9 +153,10 @@ def nested_linear_contract(
             b_m = b[:D_m]
         else:
             b_m = None
-        pad_width = (0, out_dim - D_m)
+
+        # Avoid explicit padding
         y = F.linear(x_m, w_m, b_m)
-        output[valid_mask, :] = F.pad(y, pad_width)
+        output[valid_mask, :D_m] = y
 
     return output.reshape(batch, seq_len, out_dim)
 
