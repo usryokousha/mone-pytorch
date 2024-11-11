@@ -132,8 +132,8 @@ class NestedCombine(nn.Module):
     def forward(
         self,
         z: torch.Tensor,
-        z_prime: torch.Tensor,
         router_probs: torch.Tensor,
+        z_prime: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -141,6 +141,8 @@ class NestedCombine(nn.Module):
             z_prime: Output of feedforward layer.
             router_probs: Probabilities assigned by the router.
         """
+        if z_prime is None:
+            z_prime = 0.0
         return z + (self.alpha * router_probs + 1) * z_prime
 
 

@@ -929,3 +929,9 @@ class NestedLinearContract(torch.autograd.Function):
             grad_output.transpose(0, 1), x, mask, bias=bias, experts=experts
         )
         return dx, dw, None, dbias, None
+    
+def nested_linear_expand_triton(x, w, mask, bias=None, experts=4):
+    return NestedLinearExpand.apply(x, w, mask, bias, experts)
+
+def nested_linear_contract_triton(x, w, mask, bias=None, experts=4):
+    return NestedLinearContract.apply(x, w, mask, bias, experts)
