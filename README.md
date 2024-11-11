@@ -62,12 +62,11 @@ Feel free to modify sections, add specific examples, or link the paper directly.
 - [x] Build MoNE nested linear layers
 - [x] Build efficient triton kernels for nested linear layers
 - [x] Create transformer block using MoNE components
+- [ ] Create training code to reproduce MoNE paper results (Imagenet-21k Classification)
 - [ ] Integrate MoNE into DINOv2
-- [ ] Add Hydra (Mamba v2) variant of MoNE mixer
 - [ ] Add example notebooks
 
 # Acknowledgements
 
 - [xformers](https://github.com/facebookresearch/xformers) for the memory efficient attention implementation
 - [dinov2](https://github.com/facebookresearch/dinov2) for the implementation of the DINOv2 model
-- [hydra](https://github.com/goombalab/hydra) for more attention substitute
