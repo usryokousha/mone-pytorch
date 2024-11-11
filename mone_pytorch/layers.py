@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from ops.nested_linear_triton import nested_linear_expand_triton
 from ops.nested_linear_triton import nested_linear_contract_triton
 
+from typing import Optional
+
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
 try:
@@ -43,11 +45,11 @@ class NestedLinearExpand(nn.Linear):
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
         if CUDA_AVAILABLE:
             return nested_linear_expand_triton(
-                x, self.weight, self.bias, token_mask, self.num_experts
+                x, self.weight, token_mask, self.bias, self.num_experts
             )
         else:
             return nested_linear_expand(
-                x, self.weight, self.bias, token_mask, self.num_experts
+                x, self.weight, token_mask, self.bias, self.num_experts
             )
 
     def deterministic_init(self):
@@ -89,8 +91,8 @@ class NestedLinearContract(nn.Linear):
 def nested_linear_expand(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     token_mask: torch.Tensor,
+    b: Optional[torch.Tensor] = None,
     num_experts: int = 4,
 ) -> torch.Tensor:
     batch, seq_len, in_dim = x.shape
@@ -123,8 +125,8 @@ def nested_linear_expand(
 def nested_linear_contract(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     token_mask: torch.Tensor,
+    b: Optional[torch.Tensor] = None,
     num_experts: int = 4,
 ) -> torch.Tensor:
     batch, seq_len, in_dim = x.shape

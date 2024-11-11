@@ -464,7 +464,7 @@ def nested_linear_expand_dx_kernel(
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for e_i in range(E):  # e is the number of experts
         # Get in_dim // 2^(e - e_i)
-        n_i = K >> (E - e_i - 1)
+        n_i = N >> (E - e_i - 1)
 
         # relevant offsets for a and b
         # needs to be updated for each expert
@@ -565,7 +565,8 @@ def nested_linear_expand_dw_kernel(
 
     # initialize accumulator
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    acc_bias = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    if dbias_ptr is not None:
+        acc_bias = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
     for e_i in range(E):  # e is the number of experts
         # Get out_dim // 2^(e - e_i)
         n_i = N >> (E - e_i - 1)
@@ -784,7 +785,8 @@ def nested_linear_contract_dw_kernel(
 
     # initialize accumulator
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    acc_bias = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    if dbias_ptr is not None:
+        acc_bias = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
     for e_i in range(E):  # e is the number of experts
         # Get out_dim // 2^(e - e_i)
         m_i = M >> (E - e_i - 1)
@@ -859,7 +861,7 @@ def nested_linear_contract_dw(dyT, x, mask, bias=False, experts=4):
     return dw, dbias
 
 class NestedLinearExpand(torch.autograd.Function):
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     @staticmethod
     def forward(ctx, x, w, mask, bias=None, experts=4):
         input_shape = x.shape
@@ -877,7 +879,7 @@ class NestedLinearExpand(torch.autograd.Function):
             input_shape
         )
 
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     @staticmethod
     def backward(ctx, grad_output):
         input_shape = ctx.input_shape
@@ -895,7 +897,7 @@ class NestedLinearExpand(torch.autograd.Function):
         return dx, dw, None, dbias, None
     
 class NestedLinearContract(torch.autograd.Function):
-    @custom_fwd
+    @custom_fwd(device_type="cuda")
     @staticmethod
     def forward(ctx, x, w, mask, bias=None, experts=4):
         input_shape = x.shape
@@ -913,7 +915,7 @@ class NestedLinearContract(torch.autograd.Function):
             input_shape
         )
 
-    @custom_bwd
+    @custom_bwd(device_type="cuda")
     @staticmethod
     def backward(ctx, grad_output):
         input_shape = ctx.input_shape
