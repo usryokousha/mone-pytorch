@@ -24,7 +24,7 @@ except ImportError:
     XFORMERS_AVAILABLE = False
     warnings.warn("xFormers is not available (Attention)")
 
-CUDA_AVAILABLE = 0
+CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 class NestedLinearExpand(nn.Linear):
