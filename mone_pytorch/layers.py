@@ -4,9 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ops.nested_linear_triton import nested_linear_expand_triton
-from ops.nested_linear_triton import nested_linear_contract_triton
-
 from typing import Optional
 
 
@@ -43,19 +40,9 @@ class NestedLinearExpand(nn.Linear):
         self.num_groups = num_groups
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        if CUDA_AVAILABLE:
-            return nested_linear_expand_triton(
-                x, self.weight, token_mask, self.bias, self.num_experts
-            )
-        else:
-            return nested_linear_expand(
-                x, self.weight, token_mask, self.bias, self.num_experts
-            )
-
-    def deterministic_init(self):
-        self.weight.data = torch.ones_like(self.weight.data)
-        if self.bias is not None:
-            self.bias.data = torch.zeros_like(self.bias.data)
+        return nested_linear_expand(
+            x, self.weight, token_mask, self.bias, self.num_experts
+        )
 
 
 class NestedLinearContract(nn.Linear):
@@ -72,19 +59,9 @@ class NestedLinearContract(nn.Linear):
         self.num_experts = num_experts
 
     def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        if CUDA_AVAILABLE:
-            return nested_linear_contract_triton(
-                x, self.weight, self.bias, token_mask, self.num_experts
-            )
-        else:
-            return nested_linear_contract(
-                x, self.weight, self.bias, token_mask, self.num_experts
-            )
-        
-    def deterministic_init(self):
-        self.weight.data = torch.ones_like(self.weight.data)
-        if self.bias is not None:
-            self.bias.data = torch.zeros_like(self.bias.data)
+        return nested_linear_contract(
+            x, self.weight, self.bias, token_mask, self.num_experts
+        )
 
 
 @torch.compile
@@ -104,11 +81,6 @@ def nested_linear_expand(
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (token_mask == m).view(batch_seq)
-        # N_m = valid_mask.sum().item()
-
-        # skip if no tokens are assigned to the m-th expert
-        # if N_m == 0:
-        #     continue
 
         D_m = in_dim >> (num_experts - m - 1)
 
@@ -139,11 +111,6 @@ def nested_linear_contract(
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (token_mask == m).view(batch_seq)
-        # N_m = valid_mask.sum().item()
-
-        # skip if no tokens are assigned to the m-th expert
-        # if N_m == 0:
-        #     continue
 
         D_m = out_dim >> (num_experts - m - 1)
 
