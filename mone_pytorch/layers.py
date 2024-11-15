@@ -95,14 +95,15 @@ def nested_linear_expand(
     b: Optional[torch.Tensor] = None,
     num_experts: int = 4,
 ) -> torch.Tensor:
-    batch, seq_len, in_dim = x.shape
-    in_dim = w.shape[1]
+    input_shape = x.shape
+    in_dim = x.shape[-1]
+    batch_seq = x.shape[:-1].numel()
     out_dim = w.shape[0]
-    output = torch.zeros((batch * seq_len, out_dim), device=x.device, dtype=x.dtype)
-    x = x.reshape(batch * seq_len, in_dim)
+    output = torch.zeros((batch_seq, out_dim), device=x.device, dtype=x.dtype)
+    x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         # get the valid mask for the m-th expert
-        valid_mask = (token_mask == m).view(batch * seq_len)
+        valid_mask = (token_mask == m).view(batch_seq)
         # N_m = valid_mask.sum().item()
 
         # skip if no tokens are assigned to the m-th expert
@@ -118,7 +119,7 @@ def nested_linear_expand(
         # project up to the expert dim
         output[valid_mask, :] = F.linear(x_m, w_m, b)
 
-    return output.reshape(batch, seq_len, out_dim)
+    return output.reshape(input_shape[:-1] + (out_dim,))
 
 
 @torch.compile
@@ -129,14 +130,15 @@ def nested_linear_contract(
     b: Optional[torch.Tensor] = None,
     num_experts: int = 4,
 ) -> torch.Tensor:
-    batch, seq_len, in_dim = x.shape
-    in_dim = w.shape[1]
+    input_shape = x.shape
+    in_dim = x.shape[-1]
+    batch_seq = x.shape[:-1].numel()
     out_dim = w.shape[0]
-    output = torch.zeros((batch * seq_len, out_dim), device=x.device, dtype=x.dtype)
-    x = x.reshape(batch * seq_len, in_dim)
+    output = torch.zeros((batch_seq, out_dim), device=x.device, dtype=x.dtype)
+    x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         # get the valid mask for the m-th expert
-        valid_mask = (token_mask == m).view(batch * seq_len)
+        valid_mask = (token_mask == m).view(batch_seq)
         # N_m = valid_mask.sum().item()
 
         # skip if no tokens are assigned to the m-th expert
@@ -159,7 +161,7 @@ def nested_linear_contract(
         y = F.linear(x_m, w_m, b_m)
         output[valid_mask, :D_m] = y
 
-    return output.reshape(batch, seq_len, out_dim)
+    return output.reshape(input_shape[:-1] + (out_dim,))
 
 
 class NestedFeedForward(nn.Module):
