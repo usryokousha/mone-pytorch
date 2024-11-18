@@ -1,0 +1,9 @@
+_target_: src.models.vit.vit_large
+patch_size: 16
+num_register_tokens: 0
+
+# Additional model parameters
+blocks_per_router: 2
+chunk_blocks: true
+capacity_distribution: null
+jitter_noise: 0.0 

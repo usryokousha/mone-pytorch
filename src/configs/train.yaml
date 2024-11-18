@@ -1,0 +1,47 @@
+defaults:
+  - model: vit_base
+  - _self_
+
+seed: 42
+
+train:
+  epochs: 300
+  devices: 1
+  precision: "bf16-mixed"
+  grad_clip: 1.0
+
+# Data configuration
+data:
+  batch_size: 128
+  num_workers: 4
+  train_path: "path/to/train"
+  val_path: "path/to/val"
+  
+# Optimizer configuration
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-3
+  weight_decay: 0.05
+  
+# Learning rate scheduler
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${train.epochs}
+  eta_min: 1e-5
+
+# Logging configuration
+logging:
+  wandb:
+    project: "vit-training"
+    name: null  # Will be auto-generated if not specified
+    
+# Training intervals
+gradient_accumulation: 1
+log_interval: 50
+val_interval: 1
+save_interval: 10
+
+# Checkpoint configuration
+checkpoints:
+  path: "checkpoints"
+  resume_from_checkpoint: null 

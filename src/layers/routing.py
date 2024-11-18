@@ -65,7 +65,7 @@ class ExpertPreferredRouter(nn.Module):
 
         if self.jitter_noise > 0.0:
             # add jitter noise to the logits
-            noise = torch.randn_like(logits) * self.jitter_noise
+            noise = torch.randn_like(logits, dtype=self.dtype) * self.jitter_noise
             logits = logits + noise
 
         probs = F.softmax(logits, dim=-1)
@@ -74,7 +74,8 @@ class ExpertPreferredRouter(nn.Module):
     def forward(self, input_tokens: torch.Tensor) -> torch.Tensor:
         batch_size, num_tokens, dim = input_tokens.shape
         device = input_tokens.device
-        router_probs = self._compute_router_probabilities(input_tokens)
+        dtype = input_tokens.dtype
+        router_probs = self._compute_router_probabilities(input_tokens.to(self.dtype))
 
         # Initialize token assignments with -1 (unassigned)
         token_mask = torch.full(
@@ -116,7 +117,7 @@ class ExpertPreferredRouter(nn.Module):
         # Gather the router probabilities corresponding to the assigned experts
         assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
 
-        return token_mask, assigned_probs
+        return token_mask, assigned_probs.to(dtype)
 
 
 class NestedCombine(nn.Module):

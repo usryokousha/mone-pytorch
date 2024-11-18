@@ -6,7 +6,6 @@ This repository contains a PyTorch implementation of the **Mixture of Nested Exp
 
 - **ExpertPreferredRouter**: Dynamic routing based on token importance, directing tokens to appropriate experts. [Found in `mone_pytorch/routing.py`](mone_pytorch/routing.py)
 - **Nested Linear Projections**: Includes `NestedLinearExpand` and `NestedLinearContract`, implementing nested linear projections for flexible token processing. [Located in `mone_pytorch/layers.py`](mone_pytorch/layers.py)
-- **Optimized Triton Kernels**: Custom Triton kernels to support efficient nested linear projections. [See `mone_pytorch/ops/nested_linear_triton.py`](mone_pytorch/ops/nested_linear_triton.py)
 
 ## Usage
 
@@ -18,9 +17,6 @@ The `ExpertPreferredRouter` assigns tokens to nested experts based on importance
 
 These classes manage nested linear projections to process tokens at varying computational levels. You can find these implementations in `mone_pytorch/layers.py`.
 
-### 3. Triton Kernels for Nested Projections
-
-For enhanced efficiency, the Triton kernels in `mone_pytorch/ops/nested_linear_triton.py` support the nested projections required for MoNE’s architecture.
 
 ## Example
 
@@ -70,3 +66,4 @@ Feel free to modify sections, add specific examples, or link the paper directly.
 
 - [xformers](https://github.com/facebookresearch/xformers) for the memory efficient attention implementation
 - [dinov2](https://github.com/facebookresearch/dinov2) for the implementation of the DINOv2 model
+
