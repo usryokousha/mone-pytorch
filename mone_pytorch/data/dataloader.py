@@ -1,10 +1,10 @@
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
+from torchvision.datasets import ImageFolder, ImageNet
 
-from utils.augmentation import ImageNetAugmentation
+from mone_pytorch.utils.augmentation import ClassificationAugmentation
 def build_dataloaders(cfg):
     # Create augmentation instance
-    augmentation = ImageNetAugmentation(
+    augmentation = ClassificationAugmentation(
         img_size=cfg.model.img_size,
         randaugment_num_ops=cfg.augmentation.randaugment.num_ops,
         randaugment_magnitude=cfg.augmentation.randaugment.magnitude,
@@ -14,17 +14,24 @@ def build_dataloaders(cfg):
         random_erase_prob=cfg.augmentation.random_erase.probability,
         label_smoothing=cfg.augmentation.label_smoothing,
     )
-
-    # Create datasets
-    train_dataset = ImageFolder(
-        root=cfg.paths.train_dir,
-        transform=augmentation
-    )
+    if cfg.dataset.dataset_selected == "imagenet1k":
+        # Create datasets
+        train_dataset = ImageNet(
+            root=cfg.paths.train_dir,
+            split="train",
+            transform=augmentation
+        )
     
-    val_dataset = ImageFolder(
-        root=cfg.paths.val_dir,
-        transform=lambda x: augmentation(x, is_train=False)
-    )
+        val_dataset = ImageNet(
+            root=cfg.paths.val_dir,
+            split="val",
+            transform=augmentation
+        )
+    elif cfg.dataset.dataset_selected == "imagenet21k":
+        train_dataset = ImageFolder(
+            root=cfg.paths.train_dir,
+            transform=augmentation
+        )
 
     # Create dataloaders
     train_loader = DataLoader(

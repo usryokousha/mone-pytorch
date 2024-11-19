@@ -22,13 +22,11 @@ class ExpertPreferredRouter(nn.Module):
         dim (int): The dimension of the input tokens.
         capacity_distribution (List[float]): A list of floats representing the capacity
                                              distribution across experts. Must sum to 1.0.
-        jitter_noise (float, optional): The amount of jitter noise to add to logits. Defaults to 0.0.
         dtype (torch.dtype, optional): The data type for the module. Defaults to torch.float32.
 
     Attributes:
         dim (int): The dimension of the input tokens.
         capacity_distribution (List[float]): The capacity distribution across experts.
-        jitter_noise (float): The amount of jitter noise to add to logits.
         dtype (torch.dtype): The data type for the module.
     """
 
@@ -36,7 +34,6 @@ class ExpertPreferredRouter(nn.Module):
         self,
         dim: int,
         capacity_distribution: List[float],
-        jitter_noise: float = 0.0,
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -46,7 +43,6 @@ class ExpertPreferredRouter(nn.Module):
             sum(capacity_distribution) == 1.0
         ), "The sum of the capacity distribution must be 1.0"
         self.capacity_distribution = capacity_distribution
-        self.jitter_noise = jitter_noise
         self.dtype = dtype
         self.num_experts = len(capacity_distribution)
         self.router = nn.Linear(dim, self.num_experts, dtype=dtype)
@@ -57,36 +53,37 @@ class ExpertPreferredRouter(nn.Module):
         nn.init.uniform_(self.router.weight, a=-2e-2, b=2e-2)
         nn.init.zeros_(self.router.bias)
 
-    def _compute_router_probabilities(self, input_tokens: torch.Tensor) -> torch.Tensor:
+    def _compute_router_probabilities(
+        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
+    ) -> torch.Tensor:
         """
         Compute the router probabilities for the input tokens.
         """
         logits = self.router(input_tokens)
-
-        if self.jitter_noise > 0.0:
+        if jitter_noise > 0.0:
             # add jitter noise to the logits
-            noise = torch.randn_like(logits, dtype=self.dtype) * self.jitter_noise
+            noise = torch.randn_like(logits, dtype=self.dtype) * jitter_noise
             logits = logits + noise
 
         probs = F.softmax(logits, dim=-1)
         return probs
 
-    def forward(self, input_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
+    ) -> torch.Tensor:
         batch_size, num_tokens, dim = input_tokens.shape
         device = input_tokens.device
         dtype = input_tokens.dtype
-        router_probs = self._compute_router_probabilities(input_tokens.to(self.dtype))
+        router_probs = self._compute_router_probabilities(
+            input_tokens.to(self.dtype), jitter_noise
+        )
 
         # Initialize token assignments with -1 (unassigned)
         token_mask = torch.full(
-            (batch_size, num_tokens), -1, 
-            dtype=torch.long, 
-            device=device
+            (batch_size, num_tokens), -1, dtype=torch.long, device=device
         )
         unassigned_mask = torch.ones(
-            (batch_size, num_tokens), 
-            dtype=torch.bool, 
-            device=device
+            (batch_size, num_tokens), dtype=torch.bool, device=device
         )
 
         # For each expert, assign tokens

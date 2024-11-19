@@ -1,8 +1,8 @@
 import torch
 from lightning import Fabric
 from omegaconf import DictConfig
-from src.layers.routing import compute_capacity_distribution
-from src.models.vit import NestedVisionTransformer
+from mone_pytorch.layers.routing import compute_capacity_distribution
+from mone_pytorch.models.nested_vit import NestedVisionTransformer
 
 def initialize_mone_model(cfg: DictConfig, fabric: Fabric):
     # Only calculate capacity distribution on main process

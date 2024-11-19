@@ -1,6 +1,5 @@
-import torch
 from torchvision import transforms
-from torchvision.transforms import autoaugment, random_erasing
+from torchvision.transforms import autoaugment, RandomErasing
 from torchvision.transforms.functional import InterpolationMode
 from torchvision.transforms.v2 import MixUp, CutMix
 from torch.utils.data import DataLoader
@@ -13,11 +12,11 @@ class ClassificationAugmentation:
     def __init__(
         self,
         img_size=224,
-        randaugment_num_ops=9,
-        randaugment_magnitude=0.5,
+        randaugment_num_ops=2,
+        randaugment_magnitude=9,
         mixup_alpha=0.8,
         cutmix_alpha=1.0,
-        random_erase_prob=0.25,
+        random_erase_prob=0.0,
         label_smoothing=0.1,
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
@@ -37,12 +36,14 @@ class ClassificationAugmentation:
         # Add RandAugment
         if randaugment_num_ops > 0:
             train_transforms.append(
+                transforms.RandomApply([
                 autoaugment.RandAugment(
                     num_ops=randaugment_num_ops,
                     magnitude=randaugment_magnitude,
                     num_magnitude_bins=31,
-                    interpolation=InterpolationMode.BICUBIC
-                )
+                        interpolation=InterpolationMode.BICUBIC
+                    )
+                ], p=0.5)
             )
         
         # Add normalization transforms
@@ -54,7 +55,7 @@ class ClassificationAugmentation:
         # Add random erasing
         if random_erase_prob > 0:
             train_transforms.append(
-                random_erasing.RandomErasing(p=random_erase_prob)
+                RandomErasing(p=random_erase_prob)
             )
         
         self.train_transforms = transforms.Compose(train_transforms)

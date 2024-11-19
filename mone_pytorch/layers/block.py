@@ -26,21 +26,17 @@ class NestedBlock(nn.Module):
         capacity_dist: Optional[List[float]] = None,
         norm_layer: Callable = nn.LayerNorm,
         ffn_layer: nn.Module = NestedFeedForward,
-        jitter_noise: float = 0.0,
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.num_experts = num_experts
         self.capacity_dist = capacity_dist
-        self.jitter_noise = jitter_noise
 
         self.norm1 = norm_layer(dim)
         self.router = None
         if capacity_dist is not None:
-            self.router = ExpertPreferredRouter(
-                dim, capacity_dist, jitter_noise
-            )
+            self.router = ExpertPreferredRouter(dim, capacity_dist)
         self.attention = NestedAttention(
             dim, num_heads, num_experts, qkv_bias, proj_bias, attn_drop=attn_drop
         )
@@ -61,9 +57,10 @@ class NestedBlock(nn.Module):
         x: torch.Tensor,
         expert_mask: Optional[torch.Tensor] = None,
         router_probs: Optional[torch.Tensor] = None,
+        jitter_noise: float = 0.0,
     ) -> torch.Tensor:
         if self.router is not None:
-            expert_mask, router_probs = self.router(x)
+            expert_mask, router_probs = self.router(x, jitter_noise)
         else:
             router_probs = None
         # As described in the paper

@@ -8,6 +8,10 @@ from omegaconf import DictConfig
 from typing import List, Dict, Any
 
 
+def scale_lr(cfg: DictConfig) -> float:
+    return cfg.optimizer.lr * cfg.data.batch_size / 256
+
+
 def group_params(
     model: nn.Module,
     weight_decay: float = 0.0,
@@ -101,7 +105,14 @@ def build_optimizer(
         weight_decay=cfg.optimizer.weight_decay,
     )
 
-    # Initialize optimizer
+    # Initialize optimizer and scale learning rate
     optimizer = hydra.utils.instantiate(cfg.optimizer, params=param_groups)
+    optimizer.param_groups[0]['lr'] = scale_lr(cfg)
 
-    return optimizer
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        cfg.scheduler.num_warmup_steps,
+        cfg.scheduler.num_training_steps,
+    )
+
+    return optimizer, scheduler

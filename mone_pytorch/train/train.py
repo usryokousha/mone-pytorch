@@ -6,9 +6,10 @@ from torchmetrics import MetricCollection, Accuracy, MeanMetric
 from torch.nn import ModuleDict
 from torch.optim.swa_utils import get_ema_multi_avg_fn, AveragedModel
 from fvcore.nn.flop_count import flop_count
-from data.dataloader import build_dataloaders
-from utils.logging import get_loggers
-from train.initialize import initialize_mone_model
+from mone_pytorch.data.dataloader import build_dataloaders
+from mone_pytorch.utils.logging import get_loggers
+from mone_pytorch.train.initialize import initialize_mone_model
+from mone_pytorch.utils.optimizer import build_optimizer
 
 
 def train_one_epoch(
@@ -152,8 +153,7 @@ def main(cfg: DictConfig):
     model = initialize_mone_model(cfg, fabric)
     
     # Create optimizer and scheduler
-    optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
-    scheduler = hydra.utils.instantiate(cfg.scheduler, optimizer=optimizer)
+    optimizer, scheduler = build_optimizer(model, cfg)
     
     # Setup with Fabric
     model, optimizer = fabric.setup(model, optimizer)

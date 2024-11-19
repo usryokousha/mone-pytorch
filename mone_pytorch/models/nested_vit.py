@@ -26,11 +26,13 @@ class NestedVisionTransformer(nn.Module):
         embed_dim=768,
         depth=12,
         num_experts=4,
-        capacity_dist=None,
+        capacity_dist=[1.0],
         blocks_per_router=4,
         num_heads=12,
         mlp_ratio=4.0,
-        qkv_bias=False,
+        qkv_bias=True,
+        proj_bias=True,
+        ffn_bias=True,
         qk_scale=None,
         drop_rate=0.0,
         attn_drop_rate=0.0,
@@ -61,6 +63,8 @@ class NestedVisionTransformer(nn.Module):
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
                     qk_scale=qk_scale,
                     drop=drop_rate,
                     attn_drop=attn_drop_rate,
@@ -126,14 +130,74 @@ class NestedVisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward(self, x):
+    def forward(self, x, jitter_noise=0.0):
         x = self.prepare_tokens(x)
         expert_mask = None
         router_probs = None
         for blk in self.blocks:
-            x, expert_mask, router_probs = blk(x, expert_mask, router_probs)
+            x, expert_mask, router_probs = blk(
+                x, expert_mask, router_probs, jitter_noise
+            )
         x = self.norm(x)
         # global average pooling
         return self.head(x.mean(dim=1))
-    
 
+
+def nested_vit_small(**kwargs):
+    return NestedVisionTransformer(
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+
+
+def nested_vit_base(**kwargs):
+    return NestedVisionTransformer(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+
+
+def nested_vit_large(**kwargs):
+    return NestedVisionTransformer(
+        patch_size=16,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+
+
+def nested_vit_huge(**kwargs):
+    return NestedVisionTransformer(
+        patch_size=16,
+        embed_dim=1536,
+        depth=32,
+        num_heads=24,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
+
+
+def nested_vit_giant(**kwargs):
+    return NestedVisionTransformer(
+        patch_size=16,
+        embed_dim=2048,
+        depth=48,
+        num_heads=32,
+        mlp_ratio=4,
+        qkv_bias=True,
+        **kwargs
+    )
