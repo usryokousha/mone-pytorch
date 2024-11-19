@@ -4,15 +4,17 @@ import torch
 from lightning.fabric import Fabric, seed_everything
 from torchmetrics import MetricCollection, Accuracy, MeanMetric
 from torch.nn import ModuleDict
-
-from src.data.dataloader import build_dataloaders
-from src.utils.logging import get_loggers
-from src.train.initialize import initialize_mone_model
+from torch.optim.swa_utils import get_ema_multi_avg_fn, AveragedModel
+from fvcore.nn.flop_count import flop_count
+from data.dataloader import build_dataloaders
+from utils.logging import get_loggers
+from train.initialize import initialize_mone_model
 
 
 def train_one_epoch(
     fabric: Fabric,
     model: torch.nn.Module,
+    ema_model: torch.nn.Module,
     train_loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
@@ -53,12 +55,20 @@ def train_one_epoch(
         optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
+
+        if cfg.ema.enabled and epoch >= cfg.ema.start_epoch:
+            # Update EMA model with specified frequency
+            if batch_idx % cfg.ema.update_interval == 0:
+                ema_model.update_parameters(model.module)
         
         # Update metrics
         if not isinstance(targets, (list, tuple)):  # Only update accuracy for non-mixed batches
             train_metrics.update('loss', loss)
             train_metrics.update('top1', outputs, targets)
             train_metrics.update('top5', outputs, targets)
+
+        if cfg.profile.enabled:
+            train_metrics.update('flops', flop_count(model, images).total() * 1e-9)
         
         if fabric.is_global_zero and batch_idx % 100 == 0:
             fabric.print(f"Epoch: {epoch} | Batch: {batch_idx} | Loss: {loss.item():.4f}")
@@ -75,6 +85,9 @@ def train_one_epoch(
                 "train/top5_accuracy": computed_metrics['top5'],
                 "train/learning_rate": current_lr
             }
+            if cfg.profile.enabled:
+                metrics_dict['train/flops'] = computed_metrics['flops']
+                
             fabric.log_dict(metrics_dict, step=global_step)
             
             # Reset metrics after logging
@@ -146,6 +159,11 @@ def main(cfg: DictConfig):
     model, optimizer = fabric.setup(model, optimizer)
     train_loader, val_loader = fabric.setup_dataloaders(train_loader, val_loader)
 
+       # apply EMA optionally
+    if cfg.ema.enabled:
+        ema_avg_fn = get_ema_multi_avg_fn(cfg.ema.decay)
+        ema_model = AveragedModel(model.module, avg_fn=ema_avg_fn)
+
     # Initialize metrics using ModuleDict and MetricCollection
     metrics = ModuleDict({
         'train': MetricCollection({
@@ -159,6 +177,8 @@ def main(cfg: DictConfig):
             'top5': Accuracy(task='multiclass', num_classes=cfg.model.num_classes, top_k=5)
         })
     })
+    if cfg.profile.enabled:
+        metrics['train'].add_module('flops', MeanMetric())
     metrics = metrics.to(fabric.device)
 
     # Handle checkpoint resuming
@@ -176,6 +196,7 @@ def main(cfg: DictConfig):
         train_one_epoch(
             fabric=fabric,
             model=model,
+            ema_model=ema_model,
             train_loader=train_loader,
             optimizer=optimizer,
             scheduler=scheduler,

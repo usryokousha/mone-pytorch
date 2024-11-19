@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .nested_linear import NestedLinearExpand, NestedLinearContract
+from .nested_linear import nested_feedforward, nested_feedforward_swiglu
 
 from typing import Optional, Callable
 
@@ -27,20 +27,23 @@ class NestedFeedForward(nn.Module):
         self.activation = activation
         if out_features is None:
             out_features = in_features
-        self.proj1 = NestedLinearExpand(
-            in_features, in_features * mlp_ratio, num_experts, bias=bias
-        )
-        self.proj2 = NestedLinearContract(
-            in_features * mlp_ratio, out_features, num_experts, bias=bias
-        )
-        self.drop = nn.Dropout(drop_rate)
+        self.proj1 = nn.Linear(in_features, in_features * mlp_ratio, bias=bias)
+        self.proj2 = nn.Linear(in_features * mlp_ratio, out_features, bias=bias)
+        self.drop_rate = drop_rate
 
-    def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        x = self.proj1(x, token_mask)
-        x = self.activation(x)
-        x = self.drop(x)
-        x = self.proj2(x, token_mask)
-        x = self.drop(x)
+    def forward(self, x: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
+        x = nested_feedforward(
+            x,
+            self.proj1.weight,
+            self.proj2.weight,
+            expert_mask,
+            self.proj1.bias,
+            self.proj2.bias,
+            self.activation,
+            self.drop_rate,
+            self.num_experts,
+            training=self.training,
+        )
         return x
 
 
@@ -56,22 +59,24 @@ class NestedSwiGLUFeedForward(nn.Module):
         out_features: Optional[int] = None,
         activation: Callable = None,
         num_experts: int = 4,
+        bias: bool = True,
     ):
         super().__init__()
         self.num_experts = num_experts
         self.mlp_ratio = mlp_ratio
         if out_features is None:
             out_features = in_features
-        self.proj1 = NestedLinearExpand(
-            in_features, in_features * mlp_ratio, num_experts
-        )
-        self.proj2 = NestedLinearContract(
-            in_features * mlp_ratio, out_features, num_experts
-        )
+        self.proj1 = nn.Linear(in_features, in_features * mlp_ratio, bias=bias)
+        self.proj2 = nn.Linear(in_features * mlp_ratio, out_features, bias=bias)
 
-    def forward(self, x: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        x = self.proj1(x, token_mask)
-        x1, x2 = x.chunk(2, dim=-1)
-        x = x1 * F.silu(x2)
-        x = self.proj2(x, token_mask)
+    def forward(self, x: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
+        x = nested_feedforward_swiglu(
+            x,
+            self.proj1.weight,
+            self.proj2.weight,
+            expert_mask,
+            self.proj1.bias,
+            self.proj2.bias,
+            self.num_experts,
+        )
         return x
