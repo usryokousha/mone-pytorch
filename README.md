@@ -58,8 +58,7 @@ Feel free to modify sections, add specific examples, or link the paper directly.
 - [x] Build MoNE nested linear layers
 - [x] Build efficient triton kernels for nested linear layers
 - [x] Create transformer block using MoNE components
-- [ ] Create training code to reproduce MoNE paper results (Imagenet-21k Classification)
-- [ ] Integrate MoNE into DINOv2
+- [x] Create training code to reproduce MoNE paper results (Imagenet-21k Classification)
 - [ ] Add example notebooks
 
 # Acknowledgements
