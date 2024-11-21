@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from mone_pytorch.layers.feedforward import NestedFeedForward, NestedSwiGLUFeedForward
 from mone_pytorch.layers.attention import NestedAttention
-from mone_pytorch.layers.routing import ExpertPreferredRouter, NestedCombine
+from mone_pytorch.layers import routing
 
 from typing import Optional, List, Callable
 
@@ -26,7 +26,7 @@ class NestedBlock(nn.Module):
         capacity_dist: Optional[List[float]] = None,
         norm_layer: Callable = nn.LayerNorm,
         ffn_layer: nn.Module = NestedFeedForward,
-        router_layer: nn.Module = ExpertPreferredRouter,
+        router_layer: nn.Module = routing.ExpertPreferredRouter,
     ):
         super().__init__()
         self.dim = dim
@@ -51,22 +51,28 @@ class NestedBlock(nn.Module):
             bias=ffn_bias,
         )
         self.alpha = nn.Parameter(torch.zeros(1.0))
-        self.combine = NestedCombine(dim)
+        self.combine = routing.NestedCombine(dim)
 
     def forward(
         self,
         x: torch.Tensor,
         expert_mask: Optional[torch.Tensor] = None,
-        router_probs: Optional[torch.Tensor] = None,
+        router_weights: Optional[torch.Tensor] = None,
         jitter_noise: float = 0.0,
     ) -> torch.Tensor:
         if self.router is not None:
-            expert_mask, router_probs = self.router(x, jitter_noise)
+            expert_mask, router_weights = self.router(x, router_weights, jitter_noise)
         else:
-            router_probs = None
+            router_weights = None
+
+        if isinstance(self.router, routing.ConditionedEPR):
+            router_probs = self.router.get_expert_probs(router_weights, expert_mask)
+        else:
+            router_probs = router_weights
+
         # As described in the paper
         z = x + self.attention(self.norm1(x), expert_mask)
         z_prime = self.mlp(self.norm2(z), expert_mask)
 
         output_tokens = z + (self.alpha * router_probs + 1) * z_prime
-        return output_tokens, expert_mask, router_probs
+        return output_tokens, expert_mask, router_weights

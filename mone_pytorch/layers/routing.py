@@ -137,7 +137,7 @@ class ExpertPreferredRouter(nn.Module):
         # Gather the router probabilities corresponding to the assigned experts
         assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
 
-        return token_mask, assigned_probs.to(dtype)
+        return token_mask, assigned_probs.to(dtype), None
 
 
 class ConditionedEPR(ExpertPreferredRouter):
@@ -171,10 +171,16 @@ class ConditionedEPR(ExpertPreferredRouter):
 
         return logits
 
+    def get_expert_probs(self, logits: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+        """Get probabilities for assigned experts based on logits and token mask"""
+        router_probs = F.softmax(logits, dim=-1)
+        assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
+        return assigned_probs
+
     def forward(
         self,
         input_tokens: torch.Tensor,
-        prev_logits: torch.Tensor = None,
+        router_logits: torch.Tensor = None,
         jitter_noise: float = 0.0,
     ) -> torch.Tensor:
         batch_size, num_tokens, dim = input_tokens.shape
@@ -183,7 +189,7 @@ class ConditionedEPR(ExpertPreferredRouter):
 
         # Get router logits
         router_logits = self._compute_router_logits(
-            input_tokens.to(self.dtype), prev_logits
+            input_tokens.to(self.dtype), router_logits
         )
 
         # Add jitter noise if specified
@@ -192,16 +198,13 @@ class ConditionedEPR(ExpertPreferredRouter):
                 router_logits + torch.randn_like(router_logits) * jitter_noise
             )
 
-        # Convert to probabilities
+        # Convert to probabilities for token assignment
         router_probs = F.softmax(router_logits, dim=-1)
 
         # Assign tokens to experts
         token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
 
-        # Gather the router probabilities corresponding to the assigned experts
-        assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
-
-        return token_mask, assigned_probs.to(dtype), router_logits.to(dtype)
+        return token_mask, router_logits.to(dtype)
 
 
 class NestedCombine(nn.Module):
