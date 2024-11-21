@@ -1,0 +1,15 @@
+epochs: 300
+devices: "auto"
+precision: "bf16-mixed"
+grad_clip: 1.0
+batch_size: 256
+num_workers: 8
+
+gradient_accumulation: 1
+log_interval: 50
+val_interval: 1
+save_interval: 10
+
+checkpoints:
+  path: "path/to/checkpoints"
+  resume_from_checkpoint: null # Will be auto-generated if not specified 

@@ -1,16 +1,16 @@
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import torch
 from lightning.fabric import Fabric, seed_everything
 from torchmetrics import MetricCollection, Accuracy, MeanMetric
 from torch.nn import ModuleDict
 from torch.optim.swa_utils import get_ema_multi_avg_fn, AveragedModel
 from fvcore.nn.flop_count import flop_count
+
 from mone_pytorch.data.dataloader import build_dataloaders
-from mone_pytorch.utils.logging import get_loggers
 from mone_pytorch.train.initialize import initialize_mone_model
 from mone_pytorch.utils.optimizer import build_optimizer
-
+from mone_pytorch.utils.augmentation import CutMixup
 
 def train_one_epoch(
     fabric: Fabric,
@@ -19,32 +19,31 @@ def train_one_epoch(
     train_loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
-    augmentation,
     metrics: ModuleDict,
     cfg: DictConfig,
     epoch: int
 ):
     model.train()
     train_metrics = metrics['train']
+    cutmixup = CutMixup(alpha=cfg.augmentation.cutmixup.alpha, num_classes=cfg.model.num_classes)
     
-    for batch_idx, (images, targets) in enumerate(train_loader):
-        # Apply mixup/cutmix transforms
-        images, targets = augmentation.apply_mix_transforms(images, targets)
-        
+    for batch_idx, (images, targets) in enumerate(train_loader):        
         with fabric.no_backward_sync(model, enabled=(batch_idx + 1) % cfg.gradient_accumulation != 0):
+            # Apply mixup/cutmix transforms
+            images, targets = cutmixup(images, targets)
             outputs = model(images)
             
             if isinstance(targets, (list, tuple)):
                 # Handle mixed labels from mixup/cutmix
                 targets_a, targets_b, lam = targets
                 loss = lam * torch.nn.functional.cross_entropy(
-                    outputs, targets_a, label_smoothing=augmentation.label_smoothing
+                    outputs, targets_a, label_smoothing=cfg.augmentation.label_smoothing
                 ) + (1 - lam) * torch.nn.functional.cross_entropy(
-                    outputs, targets_b, label_smoothing=augmentation.label_smoothing
+                    outputs, targets_b, label_smoothing=cfg.augmentation.label_smoothing
                 )
             else:
                 loss = torch.nn.functional.cross_entropy(
-                    outputs, targets, label_smoothing=augmentation.label_smoothing
+                    outputs, targets, label_smoothing=cfg.augmentation.label_smoothing
                 )
             
             fabric.backward(loss)
@@ -132,17 +131,30 @@ def validate(fabric: Fabric, model: torch.nn.Module, val_loader, metrics: Module
     
     return computed_metrics
 
-@hydra.main(config_path="../configs", config_name="train.yaml", version_base="1.3")
+@hydra.main(config_path="../configs", config_name="config.yaml", version_base="1.3")
 def main(cfg: DictConfig):
     # Set seed for reproducibility
     seed_everything(cfg.seed)
-    
+
+    # log experiment configuration
+    loggers = []
+    if 'csv_logger' in cfg.logging:
+        csv_logger = hydra.utils.instantiate(cfg.logging.csv_logger)
+        loggers.append(csv_logger)
+    if 'wandb' in cfg.logging:
+        wandb_logger = hydra.utils.instantiate(cfg.logging.wandb)
+        wandb_logger.experiment.config.update(OmegaConf.to_container(cfg, resolve=True))
+        loggers.append(wandb_logger)
+    if 'tensorboard' in cfg.logging:
+        tensorboard_logger = hydra.utils.instantiate(cfg.logging.tensorboard)
+        loggers.append(tensorboard_logger)
+
     # Initialize Fabric with loggers
     fabric = Fabric(
         accelerator="cuda",
-        devices=cfg.train.devices,
-        precision=cfg.train.precision,
-        loggers=get_loggers(cfg.logging)
+        devices=cfg.training.devices,
+        precision=cfg.training.precision,
+        loggers=loggers
     )
     fabric.launch()
 
@@ -159,10 +171,13 @@ def main(cfg: DictConfig):
     model, optimizer = fabric.setup(model, optimizer)
     train_loader, val_loader = fabric.setup_dataloaders(train_loader, val_loader)
 
-       # apply EMA optionally
+    # apply EMA optionally
     if cfg.ema.enabled:
         ema_avg_fn = get_ema_multi_avg_fn(cfg.ema.decay)
         ema_model = AveragedModel(model.module, avg_fn=ema_avg_fn)
+        fabric.print(f"Using EMA with decay {cfg.ema.decay}")
+    else:
+        ema_model = None
 
     # Initialize metrics using ModuleDict and MetricCollection
     metrics = ModuleDict({
@@ -190,6 +205,14 @@ def main(cfg: DictConfig):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         metrics.load_state_dict(checkpoint['metrics_state_dict'])  # Load metrics state
         start_epoch = checkpoint['epoch'] + 1
+
+    # print settings
+    fabric.print(f"Training for {cfg.train.epochs} epochs")
+    fabric.print(f"Starting from epoch {start_epoch}")
+    fabric.print(f"Effective batch size: {cfg.train.batch_size * cfg.train.devices * cfg.gradient_accumulation}")
+    fabric.print(f"Effective learning rate: {cfg.train.learning_rate * cfg.train.devices * cfg.gradient_accumulation}")
+    fabric.print(f"Using {cfg.train.precision} precision")
+    fabric.print(f"Using {cfg.train.devices} devices")
 
     # Training loop
     for epoch in range(start_epoch, cfg.train.epochs):

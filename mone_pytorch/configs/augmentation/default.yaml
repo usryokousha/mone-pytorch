@@ -1,0 +1,12 @@
+randaugment:
+  num_ops: 2
+  magnitude: 9
+mixup:
+  enabled: true
+  alpha: 0.8
+cutmix:
+  enabled: true
+  alpha: 1.0
+random_erase:
+  probability: 0.25
+label_smoothing: 0.1

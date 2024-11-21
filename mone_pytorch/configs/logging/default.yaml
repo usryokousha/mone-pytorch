@@ -1,0 +1,8 @@
+loggers:
+  - _target_: wandb.integration.fabric.WandbCallback
+    project: "mone-pytorch"
+    save_dir: "path/to/save"
+    name: ${experiment_name}
+  - _target_: lightning.pytorch.loggers.CSVLogger
+    root_dir: "path/to/save"
+    name: ${experiment_name}

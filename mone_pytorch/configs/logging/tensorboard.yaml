@@ -1,0 +1,4 @@
+tensorboard:
+  _target_: lightning.fabric.loggers.TensorBoardLogger
+  name: ${experiment_name}
+  save_dir: ${save_dir}/${experiment_name}

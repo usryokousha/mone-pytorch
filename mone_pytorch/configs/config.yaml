@@ -1,0 +1,15 @@
+defaults:
+  - mone: default
+  - model: base
+  - optimizer: adamw
+  - data: imagenet1k
+  - augmentation: default
+  - training: default
+  - logging:
+    - csv_logger
+    - wandb
+  - _self_
+
+seed: 42
+experiment_name: "default"
+save_dir: "experiments"

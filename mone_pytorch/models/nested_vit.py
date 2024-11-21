@@ -11,7 +11,6 @@ import torch.nn as nn
 from mone_pytorch.layers.patch_embed import PatchEmbed
 from mone_pytorch.layers.block import NestedBlock
 from mone_pytorch.layers.feedforward import NestedFeedForward
-from utils import trunc_normal_
 
 
 class NestedVisionTransformer(nn.Module):
@@ -27,7 +26,7 @@ class NestedVisionTransformer(nn.Module):
         depth=12,
         num_experts=4,
         capacity_dist=[1.0],
-        blocks_per_router=4,
+        num_routers=1,
         num_heads=12,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -55,6 +54,7 @@ class NestedVisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.blocks = nn.ModuleList([])
+        blocks_per_router = depth // num_routers
         for i in range(depth):
             add_router = i % blocks_per_router == 0
             self.blocks.append(
@@ -83,12 +83,12 @@ class NestedVisionTransformer(nn.Module):
             nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
         )
 
-        trunc_normal_(self.pos_embed, std=0.02)
+        torch.nn.init.trunc_normal_(self.pos_embed, std=0.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
+            torch.nn.init.trunc_normal_(m.weight, std=0.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -143,9 +143,9 @@ class NestedVisionTransformer(nn.Module):
         return self.head(x.mean(dim=1))
 
 
-def nested_vit_small(**kwargs):
+def nested_vit_small(patch_size=16, **kwargs):
     return NestedVisionTransformer(
-        patch_size=16,
+        patch_size=patch_size,
         embed_dim=384,
         depth=12,
         num_heads=6,
@@ -155,9 +155,9 @@ def nested_vit_small(**kwargs):
     )
 
 
-def nested_vit_base(**kwargs):
+def nested_vit_base(patch_size=16, **kwargs):
     return NestedVisionTransformer(
-        patch_size=16,
+        patch_size=patch_size,
         embed_dim=768,
         depth=12,
         num_heads=12,
@@ -167,9 +167,9 @@ def nested_vit_base(**kwargs):
     )
 
 
-def nested_vit_large(**kwargs):
+def nested_vit_large(patch_size=16, **kwargs):
     return NestedVisionTransformer(
-        patch_size=16,
+        patch_size=patch_size,
         embed_dim=1024,
         depth=24,
         num_heads=16,
@@ -179,9 +179,9 @@ def nested_vit_large(**kwargs):
     )
 
 
-def nested_vit_huge(**kwargs):
+def nested_vit_huge(patch_size=16, **kwargs):
     return NestedVisionTransformer(
-        patch_size=16,
+        patch_size=patch_size,
         embed_dim=1536,
         depth=32,
         num_heads=24,
@@ -191,9 +191,9 @@ def nested_vit_huge(**kwargs):
     )
 
 
-def nested_vit_giant(**kwargs):
+def nested_vit_giant(patch_size=16, **kwargs):
     return NestedVisionTransformer(
-        patch_size=16,
+        patch_size=patch_size,
         embed_dim=2048,
         depth=48,
         num_heads=32,

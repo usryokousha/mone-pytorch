@@ -1,0 +1,6 @@
+dataset_name: imagenet1k
+train_path: "path/to/train"
+val_path: "path/to/val"
+num_classes: 1000
+training_size: 1281167
+validation_size: 50000

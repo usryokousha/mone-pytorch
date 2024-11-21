@@ -1,8 +1,9 @@
-_target_: mone_pytorch.models.nested_vit.nested_vit_large
+_target_: mone_pytorch.models.nested_vit.nested_vit_giant
 patch_size: 16
 img_size: 224
 num_register_tokens: 0
 num_classes: ${data.num_classes}
+
 # Additional model parameters
 num_routers: 1
 capacity_distribution: null

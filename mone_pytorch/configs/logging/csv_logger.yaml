@@ -1,0 +1,4 @@
+csv_logger:
+  _target_: lightning.fabric.loggers.CSVLogger
+  root_dir: ${save_dir}/${experiment_name}
+  name: ${experiment_name}

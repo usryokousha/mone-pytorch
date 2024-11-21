@@ -1,0 +1,6 @@
+mone:
+  effective_capacity: 1.0
+  num_experts: 4
+  delta: 2
+  beta: 10
+  jitter_noise: 0.0 
