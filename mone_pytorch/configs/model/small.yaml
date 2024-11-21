@@ -6,4 +6,5 @@ num_register_tokens: 0
 blocks_per_router: 2
 chunk_blocks: true
 capacity_distribution: null
-jitter_noise: 0.0 
+router_type: epr
+ffn_type: ff

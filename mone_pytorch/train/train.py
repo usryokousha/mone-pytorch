@@ -140,9 +140,10 @@ def main(cfg: DictConfig):
     # Initialize Fabric with loggers
     fabric = Fabric(
         accelerator="cuda",
-        devices=cfg.train.devices,
-        precision=cfg.train.precision,
-        loggers=get_loggers(cfg.logging)
+        devices=cfg.training.devices,
+        precision=cfg.training.precision,
+        strategy=cfg.training.strategy,
+        loggers=loggers
     )
     fabric.launch()
 

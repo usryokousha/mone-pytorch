@@ -26,6 +26,7 @@ class NestedBlock(nn.Module):
         capacity_dist: Optional[List[float]] = None,
         norm_layer: Callable = nn.LayerNorm,
         ffn_layer: nn.Module = NestedFeedForward,
+        router_layer: nn.Module = ExpertPreferredRouter,
     ):
         super().__init__()
         self.dim = dim
@@ -36,7 +37,7 @@ class NestedBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.router = None
         if capacity_dist is not None:
-            self.router = ExpertPreferredRouter(dim, capacity_dist)
+            self.router = router_layer(dim, capacity_dist)
         self.attention = NestedAttention(
             dim, num_heads, num_experts, qkv_bias, proj_bias, attn_drop=attn_drop
         )

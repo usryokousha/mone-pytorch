@@ -10,9 +10,8 @@ import torch.nn as nn
 
 from mone_pytorch.layers.patch_embed import PatchEmbed
 from mone_pytorch.layers.block import NestedBlock
-from mone_pytorch.layers.feedforward import NestedFeedForward
-from utils import trunc_normal_
-
+from mone_pytorch.layers.feedforward import NestedFeedForward, NestedSwiGLUFeedForward
+from mone_pytorch.layers.routing import ExpertPreferredRouter, ConditionedEPR
 
 class NestedVisionTransformer(nn.Module):
     """Vision Transformer"""
@@ -39,6 +38,7 @@ class NestedVisionTransformer(nn.Module):
         router_noise=0.0,
         norm_layer=nn.LayerNorm,
         ffn_layer=NestedFeedForward,
+        router_layer=ExpertPreferredRouter,
         **kwargs
     ):
         super().__init__()
@@ -71,6 +71,7 @@ class NestedVisionTransformer(nn.Module):
                     num_experts=num_experts,
                     capacity_dist=capacity_dist if add_router else None,
                     ffn_layer=ffn_layer,
+                    router_layer=router_layer,
                     norm_layer=norm_layer,
                     jitter_noise=router_noise,
                 )
@@ -143,7 +144,19 @@ class NestedVisionTransformer(nn.Module):
         return self.head(x.mean(dim=1))
 
 
-def nested_vit_small(**kwargs):
+router_dict = {
+    'epr': ExpertPreferredRouter,
+    'cepr': ConditionedEPR,
+}
+
+ffn_dict = {
+    'ff': NestedFeedForward,
+    'swiglu': NestedSwiGLUFeedForward,
+}
+
+def nested_vit_small(patch_size=16, router_type='epr', ffn_type='ff', **kwargs):
+    router_class = router_dict[router_type]
+    ffn_class = ffn_dict[ffn_type]
     return NestedVisionTransformer(
         patch_size=16,
         embed_dim=384,
@@ -151,11 +164,15 @@ def nested_vit_small(**kwargs):
         num_heads=6,
         mlp_ratio=4,
         qkv_bias=True,
+        router_layer=router_class,
+        ffn_layer=ffn_class,
         **kwargs
     )
 
 
-def nested_vit_base(**kwargs):
+def nested_vit_base(patch_size=16, router_type='epr', ffn_type='ff', **kwargs):
+    router_class = router_dict[router_type]
+    ffn_class = ffn_dict[ffn_type]
     return NestedVisionTransformer(
         patch_size=16,
         embed_dim=768,
@@ -163,11 +180,15 @@ def nested_vit_base(**kwargs):
         num_heads=12,
         mlp_ratio=4,
         qkv_bias=True,
+        router_layer=router_class,
+        ffn_layer=ffn_class,
         **kwargs
     )
 
 
-def nested_vit_large(**kwargs):
+def nested_vit_large(patch_size=16, router_type='epr', ffn_type='ff', **kwargs):
+    router_class = router_dict[router_type]
+    ffn_class = ffn_dict[ffn_type]
     return NestedVisionTransformer(
         patch_size=16,
         embed_dim=1024,
@@ -175,11 +196,15 @@ def nested_vit_large(**kwargs):
         num_heads=16,
         mlp_ratio=4,
         qkv_bias=True,
+        router_layer=router_class,
+        ffn_layer=ffn_class,
         **kwargs
     )
 
 
-def nested_vit_huge(**kwargs):
+def nested_vit_huge(patch_size=16, router_type='epr', ffn_type='ff', **kwargs):
+    router_class = router_dict[router_type]
+    ffn_class = ffn_dict[ffn_type]
     return NestedVisionTransformer(
         patch_size=16,
         embed_dim=1536,
@@ -187,11 +212,15 @@ def nested_vit_huge(**kwargs):
         num_heads=24,
         mlp_ratio=4,
         qkv_bias=True,
+        router_layer=router_class,
+        ffn_layer=ffn_class,
         **kwargs
     )
 
 
-def nested_vit_giant(**kwargs):
+def nested_vit_giant(patch_size=16, router_type='epr', ffn_type='ff', **kwargs):
+    router_class = router_dict[router_type]
+    ffn_class = ffn_dict[ffn_type]
     return NestedVisionTransformer(
         patch_size=16,
         embed_dim=2048,
@@ -199,5 +228,7 @@ def nested_vit_giant(**kwargs):
         num_heads=32,
         mlp_ratio=4,
         qkv_bias=True,
+        router_layer=router_class,
+        ffn_layer=ffn_class,
         **kwargs
     )

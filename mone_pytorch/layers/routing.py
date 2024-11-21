@@ -68,15 +68,21 @@ class ExpertPreferredRouter(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return probs
 
-    def forward(
-        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
+    def _assign_tokens_to_experts(
+        self, router_probs: torch.Tensor, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        batch_size, num_tokens, dim = input_tokens.shape
-        device = input_tokens.device
-        dtype = input_tokens.dtype
-        router_probs = self._compute_router_probabilities(
-            input_tokens.to(self.dtype), jitter_noise
-        )
+        """
+        Assign tokens to experts based on router probabilities and capacity constraints.
+
+        Args:
+            router_probs: Tensor of shape [batch_size, num_tokens, num_experts] containing router probabilities
+            num_tokens: Number of tokens to assign
+            device: Device to place tensors on
+
+        Returns:
+            token_mask: Tensor of shape [batch_size, num_tokens] containing expert assignments
+        """
+        batch_size = router_probs.shape[0]
 
         # Initialize token assignments with -1 (unassigned)
         token_mask = torch.full(
@@ -111,10 +117,91 @@ class ExpertPreferredRouter(nn.Module):
         # Assign any remaining unassigned tokens to expert 0
         token_mask[token_mask == -1] = 0
 
+        return token_mask
+
+    def forward(
+        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
+    ) -> torch.Tensor:
+        batch_size, num_tokens, dim = input_tokens.shape
+        device = input_tokens.device
+        dtype = input_tokens.dtype
+
+        # Get router probabilities
+        router_probs = self._compute_router_probabilities(
+            input_tokens.to(self.dtype), jitter_noise
+        )
+
+        # Assign tokens to experts
+        token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
+
         # Gather the router probabilities corresponding to the assigned experts
         assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
 
         return token_mask, assigned_probs.to(dtype)
+
+
+class ConditionedEPR(ExpertPreferredRouter):
+    """
+    Conditioned Expert Preferred Router for the MONE model.
+    Extends ExpertPreferredRouter to condition routing decisions on previous layer logits.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Additional projection for concatenated logits
+        self.logit_projection = nn.Linear(
+            2 * self.num_experts, self.num_experts, dtype=self.dtype
+        )
+
+    def _compute_router_logits(
+        self, input_tokens: torch.Tensor, prev_router_logits: torch.Tensor = None
+    ) -> torch.Tensor:
+        # Get initial logits from input tokens
+        logits = self.router(input_tokens)  # [batch_size, num_tokens, num_experts]
+
+        if prev_router_logits is not None:
+            # Concatenate with previous layer logits
+            logits = torch.cat(
+                [logits, prev_router_logits], dim=-1
+            )  # [batch_size, num_tokens, 2*num_experts]
+            # Project back to num_experts dimension
+            logits = self.logit_projection(
+                logits
+            )  # [batch_size, num_tokens, num_experts]
+
+        return logits
+
+    def forward(
+        self,
+        input_tokens: torch.Tensor,
+        prev_logits: torch.Tensor = None,
+        jitter_noise: float = 0.0,
+    ) -> torch.Tensor:
+        batch_size, num_tokens, dim = input_tokens.shape
+        device = input_tokens.device
+        dtype = input_tokens.dtype
+
+        # Get router logits
+        router_logits = self._compute_router_logits(
+            input_tokens.to(self.dtype), prev_logits
+        )
+
+        # Add jitter noise if specified
+        if jitter_noise > 0:
+            router_logits = (
+                router_logits + torch.randn_like(router_logits) * jitter_noise
+            )
+
+        # Convert to probabilities
+        router_probs = F.softmax(router_logits, dim=-1)
+
+        # Assign tokens to experts
+        token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
+
+        # Gather the router probabilities corresponding to the assigned experts
+        assigned_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
+
+        return token_mask, assigned_probs.to(dtype), router_logits.to(dtype)
 
 
 class NestedCombine(nn.Module):

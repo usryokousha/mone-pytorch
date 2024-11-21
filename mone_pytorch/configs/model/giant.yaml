@@ -1,10 +1,11 @@
-_target_: src.models.vit.vit_large
+_target_: mone_pytorch.models.nested_vit.nested_vit_giant
 patch_size: 16
+img_size: 224
 num_register_tokens: 0
+num_classes: ${data.num_classes}
 
 # Additional model parameters
-blocks_per_router: 2
-chunk_blocks: true
+num_routers: 1
 capacity_distribution: null
 router_type: epr
 ffn_type: ff

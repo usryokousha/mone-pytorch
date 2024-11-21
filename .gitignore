@@ -1,2 +1,6 @@
 *.pyc
 
+outputs/
+**/outputs/
+launch.json
+
