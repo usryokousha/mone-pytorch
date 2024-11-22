@@ -1,4 +1,9 @@
-_target_: mone_pytorch.models.nested_vit.nested_vit_large
+_target_: mone_pytorch.models.NestedVisionTransformer
+embed_dim: 1024
+depth: 24
+num_heads: 16
+mlp_ratio: 4
+qkv_bias: true
 patch_size: 16
 img_size: 224
 num_register_tokens: 0

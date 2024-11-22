@@ -143,7 +143,7 @@ def main(cfg: DictConfig):
         loggers.append(csv_logger)
     if 'wandb' in cfg.logging:
         wandb_logger = hydra.utils.instantiate(cfg.logging.wandb)
-        wandb_logger.experiment.config.update(OmegaConf.to_container(cfg, resolve=True))
+        wandb_logger.experiment.config.update(OmegaConf.to_container(cfg))
         loggers.append(wandb_logger)
     if 'tensorboard' in cfg.logging:
         tensorboard_logger = hydra.utils.instantiate(cfg.logging.tensorboard)
@@ -154,8 +154,12 @@ def main(cfg: DictConfig):
         accelerator="cuda",
         devices=cfg.training.devices,
         precision=cfg.training.precision,
+        strategy=cfg.training.strategy,
         loggers=loggers
     )
+    # set accumulation rank for Flora strategy
+    if cfg.training.strategy.startswith('flora'):
+        fabric._strategy.accumulation_rank = cfg.training.accumulation_rank
     fabric.launch()
 
     # Get dataloaders and augmentation
