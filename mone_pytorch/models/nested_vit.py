@@ -54,7 +54,6 @@ class NestedVisionTransformer(nn.Module):
         qk_scale=None,
         drop_rate=0.0,
         attn_drop_rate=0.0,
-        router_noise=0.0,
         norm_layer=nn.LayerNorm,
         ffn_layer=NestedFeedForward,
         router_layer=ExpertPreferredRouter,
@@ -73,7 +72,7 @@ class NestedVisionTransformer(nn.Module):
         )
         num_patches = self.patch_embed.num_patches
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.blocks = nn.ModuleList([])
         blocks_per_router = depth // num_routers
@@ -88,13 +87,12 @@ class NestedVisionTransformer(nn.Module):
                     proj_bias=proj_bias,
                     ffn_bias=ffn_bias,
                     qk_scale=qk_scale,
-                    drop=drop_rate,
+                    proj_drop=drop_rate,
                     attn_drop=attn_drop_rate,
                     num_experts=num_experts,
                     capacity_dist=capacity_dist if add_router else None,
                     ffn_layer=ffn_layer,
                     norm_layer=norm_layer,
-                    jitter_noise=router_noise,
                     router_layer=router_layer,
                 )
             )

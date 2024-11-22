@@ -1,11 +1,12 @@
 import math
-import hydra
+from omegaconf import DictConfig
 import torch
 import torch.nn as nn
-from lightning import Fabric
 from torch.optim.lr_scheduler import LambdaLR
-from omegaconf import DictConfig
-from typing import List, Dict, Any
+
+from mone_pytorch.optimizer.flora import Flora
+
+from typing import List, Dict, Any, Tuple
 
 
 def scale_lr(lr: float, batch_size: int, grad_accum: int, num_gpus: int) -> float:
@@ -15,26 +16,35 @@ def scale_lr(lr: float, batch_size: int, grad_accum: int, num_gpus: int) -> floa
 def group_params(
     model: nn.Module,
     weight_decay: float = 0.0,
-    decay_modules: List[nn.Module] = [nn.Linear],
-    no_decay_modules: List[nn.Module] = [nn.LayerNorm, nn.Embedding],
+    decay_modules: Tuple[nn.Module] = (nn.Linear,),
+    no_decay_modules: Tuple[nn.Module] = (nn.LayerNorm, nn.Embedding),
 ) -> List[Dict[str, Any]]:
     """
     Group model parameters into parameter groups.
     """
     decay = set()
     no_decay = set()
+    special = set()
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     for mod_name, mod in model.named_modules():
         for param_name, param in mod.named_parameters():
             full_param_name = f"{mod_name}.{param_name}" if mod_name else param_name
+            if not param.requires_grad or full_param_name not in param_dict:
+                continue  # frozen weights
+            if hasattr(param, '_optim'):
+                special.add(full_param_name)
             if full_param_name.endswith("bias"):
-                no_decay.add(param)
+                no_decay.add(full_param_name)
             elif full_param_name.endswith("weight") and isinstance(mod, decay_modules):
-                decay.add(param)
+                decay.add(full_param_name)
             elif full_param_name.endswith("weight") and isinstance(
                 mod, no_decay_modules
             ):
-                no_decay.add(param)
-    param_dict = {param_name: param for param_name, param in model.named_parameters()}
+                no_decay.add(full_param_name)
+            elif getattr(param, '_no_weight_decay', False):
+                no_decay.add(full_param_name)
+
+    decay |= (param_dict.keys() - no_decay - special)
     inter_params = decay & no_decay
     union_params = decay | no_decay
     assert (
@@ -42,21 +52,23 @@ def group_params(
     ), f"parameters {inter_params} are in both decay and no decay!"
     assert (
         len(param_dict.keys() - union_params) == 0
-    ), f"parameters {param_dict.keys() - union_params} not separated"
-    optim_groups = [
-        {
-            "params": [
-                param_dict[param_name] for param_name in sorted(list(union_params))
-            ],
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [param_dict[param_name] for param_name in sorted(list(no_decay))],
-            "weight_decay": 0.0,
-        },
-    ]
-    return optim_groups
-
+    ), f"parameters {param_dict.keys() - special - union_params} not separated"
+    
+    if weight_decay == 0.0 or not no_decay:
+        param_groups = [{"params": [param_dict[pn] for pn in sorted(list(no_decay | decay))],
+                         "weight_decay": weight_decay}]
+    else:
+        param_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+    # Add parameters with special hyperparameters
+    # Unique dicts
+    hparams = [dict(s) for s in set(frozenset(param_dict[pn]._optim.items()) for pn in special)]
+    for hparam in hparams:
+        params = [param_dict[pn] for pn in sorted(list(special)) if param_dict[pn]._optim == hparam]
+        param_groups.append({"params": params, **hparam})
+    return param_groups
 
 # adapted from Torchtune implementation
 def get_cosine_schedule_with_warmup(
@@ -88,7 +100,7 @@ def get_cosine_schedule_with_warmup(
 def build_optimizer(
     cfg: DictConfig,
     model: nn.Module,
-    num_processes: int,
+    world_size: int,
 ) -> torch.optim.Optimizer:
     """
     Build optimizer with parameter groups.
@@ -104,16 +116,22 @@ def build_optimizer(
     # Group parameters
     param_groups = group_params(
         model,
-        weight_decay=cfg.optimizer.weight_decay,
+        weight_decay=cfg.optimizer.hparams.weight_decay,
     )
 
-    # Initialize optimizer and scale learning rate
-    optimizer = hydra.utils.instantiate(cfg.optimizer, params=param_groups)
+    # Initialize optimizer - modify this line
+    if cfg.optimizer.name == "AdamW":
+        optimizer = torch.optim.AdamW(param_groups, **cfg.optimizer.hparams)
+    elif cfg.optimizer.name == "Flora":
+        optimizer = Flora(param_groups, **cfg.optimizer.hparams)
+    else:
+        raise ValueError(f"Optimizer {cfg.optimizer.name} not supported")
+    
     optimizer.param_groups[0]["lr"] = scale_lr(
-        cfg.optimizer.lr,
-        cfg.train.batch_size,
-        cfg.gradient_accumulation,
-        num_processes,
+        cfg.optimizer.hparams.lr,
+        cfg.training.batch_size,
+        cfg.training.gradient_accumulation,
+        world_size,
     )
 
     scheduler = get_cosine_schedule_with_warmup(

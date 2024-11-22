@@ -1,0 +1,2 @@
+num_warmup_steps: int = 1000
+num_training_steps: int = ${training.epochs} * ${data.training_size} * ${training.gradient_accumulation}

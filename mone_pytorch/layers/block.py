@@ -18,6 +18,7 @@ class NestedBlock(nn.Module):
         num_experts: int,
         mlp_ratio: int = 4,
         qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
         proj_bias: bool = True,
         ffn_bias: bool = True,
         attn_drop: float = 0.0,
@@ -39,19 +40,18 @@ class NestedBlock(nn.Module):
         if capacity_dist is not None:
             self.router = router_layer(dim, capacity_dist)
         self.attention = NestedAttention(
-            dim, num_heads, num_experts, qkv_bias, proj_bias, attn_drop=attn_drop
+            dim, num_heads, num_experts, qkv_bias, proj_bias, qk_scale, attn_drop=attn_drop
         )
         self.norm2 = norm_layer(dim)
         self.mlp = ffn_layer(
             dim,
             mlp_ratio,
             num_experts,
-            act_layer=act_layer,
+            activation=act_layer,
             drop_rate=proj_drop,
             bias=ffn_bias,
         )
-        self.alpha = nn.Parameter(torch.zeros(1.0))
-        self.combine = routing.NestedCombine(dim)
+        self.alpha = nn.Parameter(torch.zeros((1,)))
 
     def forward(
         self,

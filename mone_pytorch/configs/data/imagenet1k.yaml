@@ -1,6 +1,5 @@
 dataset_name: imagenet1k
-train_path: "/mnt/Auxiliary/datasets/imagenet/train"
-val_path: "/mnt/Auxiliary/datasets/imagenet/val"
+path: "/mnt/Auxiliary/datasets/imagenet"
 num_classes: 1000
 training_size: 1281167
 validation_size: 50000

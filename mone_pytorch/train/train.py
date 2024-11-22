@@ -48,27 +48,27 @@ def train_one_epoch(
             
             fabric.backward(loss)
         
-        # Add gradient clipping before optimizer step
-        if hasattr(cfg.train, 'grad_clip'):
-            fabric.clip_gradients(model, optimizer, max_norm=cfg.train.grad_clip)
-        
-        optimizer.step()
-        optimizer.zero_grad()
-        scheduler.step()
+        # Only update metrics and optimizer when gradient accumulation is complete
+        if (batch_idx + 1) % cfg.gradient_accumulation == 0:
+            if hasattr(cfg.training, 'grad_clip'):
+                fabric.clip_gradients(model, optimizer, max_norm=cfg.training.grad_clip)
+            
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
 
-        if cfg.ema.enabled and epoch >= cfg.ema.start_epoch:
-            # Update EMA model with specified frequency
-            if batch_idx % cfg.ema.update_interval == 0:
-                ema_model.update_parameters(model.module)
-        
-        # Update metrics
-        if not isinstance(targets, (list, tuple)):  # Only update accuracy for non-mixed batches
-            train_metrics.update('loss', loss)
-            train_metrics.update('top1', outputs, targets)
-            train_metrics.update('top5', outputs, targets)
+            if cfg.ema.enabled and epoch >= cfg.ema.start_epoch:
+                if batch_idx % cfg.ema.update_interval == 0:
+                    ema_model.update_parameters(model.module)
+            
+            # Update metrics only after accumulation
+            if not isinstance(targets, (list, tuple)):
+                train_metrics.update('loss', loss)
+                train_metrics.update('top1', outputs, targets)
+                train_metrics.update('top5', outputs, targets)
 
-        if cfg.profile.enabled:
-            train_metrics.update('flops', flop_count(model, images).total() * 1e-9)
+            if cfg.profile.enabled:
+                train_metrics.update('flops', flop_count(model, images).total() * 1e-9)
         
         if fabric.is_global_zero and batch_idx % 100 == 0:
             fabric.print(f"Epoch: {epoch} | Batch: {batch_idx} | Loss: {loss.item():.4f}")
@@ -76,7 +76,8 @@ def train_one_epoch(
         # Log training metrics
         if batch_idx % cfg.log_interval == 0:
             current_lr = optimizer.param_groups[0]['lr']
-            global_step = epoch * len(train_loader) + batch_idx
+            # Adjust global step to account for gradient accumulation
+            global_step = (epoch * len(train_loader) + batch_idx) // cfg.gradient_accumulation
             
             computed_metrics = train_metrics.compute()
             metrics_dict = {
@@ -169,7 +170,7 @@ def main(cfg: DictConfig):
     model = initialize_model(cfg, fabric)
     
     # Create optimizer and scheduler
-    optimizer, scheduler = build_optimizer(cfg, model, fabric.num_processes)
+    optimizer, scheduler = build_optimizer(cfg, model, fabric.world_size)
     
     # Setup with Fabric
     model, optimizer = fabric.setup(model, optimizer)

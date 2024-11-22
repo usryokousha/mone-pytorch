@@ -19,13 +19,13 @@ def build_dataloaders(cfg):
     if 'imagenet1k' == cfg.data.dataset_name:
         # Create datasets
         train_dataset = ImageNet(
-            root=cfg.data.train_path,
+            root=cfg.data.path,
             split="train",
             transform=train_augmentation
         )
     
         val_dataset = ImageNet(
-            root=cfg.data.val_path,
+            root=cfg.data.path,
             split="val",
             transform=val_augmentation
         )
@@ -44,18 +44,18 @@ def build_dataloaders(cfg):
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg.train.batch_size,
+        batch_size=cfg.training.batch_size,
         shuffle=True,
-        num_workers=cfg.train.num_workers,
+        num_workers=cfg.training.num_workers,
         pin_memory=True,
         drop_last=True
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=cfg.train.batch_size,
+        batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=cfg.train.num_workers,
+        num_workers=cfg.training.num_workers,
         pin_memory=True
     )
 

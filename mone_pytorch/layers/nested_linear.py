@@ -12,13 +12,11 @@ class NestedLinearExpand(nn.Linear):
         out_features: int,
         bias: bool = True,
         num_experts=4,
-        num_groups=1,
         device=None,
         dtype=None,
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.num_experts = num_experts
-        self.num_groups = num_groups
 
     def forward(self, x: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
         return nested_linear_expand(

@@ -214,7 +214,7 @@ class NestedCombine(nn.Module):
 
     def __init__(self, dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.alpha = nn.Parameter(torch.zeros(1, dtype=dtype))
+        self.alpha = nn.Parameter(torch.zeros((1,), dtype=dtype))
         self.dtype = dtype
 
     def forward(

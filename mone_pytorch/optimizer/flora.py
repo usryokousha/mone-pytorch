@@ -3,11 +3,10 @@ import logging
 import math
 from functools import partial
 from typing import Any, Callable, Dict, Generator, Iterable, Optional, Sequence, Union
-
+from typing_extensions import override
 import bitsandbytes.functional as bnbf
 import torch
-from lightning.fabric import Fabric
-from lightning.fabric import strategies
+from lightning.fabric import Fabric, strategies
 from torch.optim.optimizer import Optimizer
 
 logger = logging.getLogger(__name__)
@@ -34,19 +33,31 @@ def next_seed(seed: int, adv: int = 0xF) -> int:
     """
     generator = torch.Generator().manual_seed(seed)
     return torch.randint(
-        0, torch.iinfo(torch.int64).max, (adv,), generator=generator, device=generator.device
+        0,
+        torch.iinfo(torch.int64).max,
+        (adv,),
+        generator=generator,
+        device=generator.device,
     ).tolist()[-1]
 
 
 def split_seed(seed: int) -> tuple[int, int]:
     generator = torch.Generator().manual_seed(seed)
     return tuple(
-        torch.randint(0, torch.iinfo(torch.int64).max, (2,), generator=generator, device=generator.device).tolist()
+        torch.randint(
+            0,
+            torch.iinfo(torch.int64).max,
+            (2,),
+            generator=generator,
+            device=generator.device,
+        ).tolist()
     )
 
 
 def with_flora_fabric(
-    step_function: Callable[[Optimizer, dict, torch.Tensor, torch.Tensor], Optional[float]],
+    step_function: Callable[
+        [Optimizer, dict, torch.Tensor, torch.Tensor], Optional[float]
+    ],
 ) -> Callable[[Fabric, Optimizer, dict, torch.Tensor, Optional[torch.Tensor]], None]:
     def wrapper(fabric, optimizer, group, p, *args, **kwargs):
         with torch.no_grad():
@@ -58,7 +69,9 @@ def with_flora_fabric(
                     fabric.packs[p] = p.grad
             else:
                 seed = fabric.seeds[p]
-                fabric.packs[p] = fabric._down_project(seed, p.grad) + fabric.packs.get(p, 0.0)
+                fabric.packs[p] = fabric._down_project(seed, p.grad) + fabric.packs.get(
+                    p, 0.0
+                )
 
             p.grad = None
 
@@ -81,7 +94,12 @@ def with_flora_fabric(
     return wrapper
 
 
-def flora_step_(optimizer: Optimizer, group: Dict, p: torch.Tensor, grad: Optional[torch.Tensor] = None):
+def flora_step_(
+    optimizer: Optimizer,
+    group: Dict,
+    p: torch.Tensor,
+    grad: Optional[torch.Tensor] = None,
+):
     """
     Performs a single optimization step
 
@@ -107,7 +125,9 @@ def flora_step_(optimizer: Optimizer, group: Dict, p: torch.Tensor, grad: Option
     state = optimizer.state[p]
     grad_shape = grad.shape
 
-    factored, use_first_moment, factored_momentum = optimizer._get_options(group, grad_shape)
+    factored, use_first_moment, factored_momentum = optimizer._get_options(
+        group, grad_shape
+    )
 
     # State Initialization
     if "step" not in state:
@@ -127,7 +147,9 @@ def flora_step_(optimizer: Optimizer, group: Dict, p: torch.Tensor, grad: Option
                 state["exp_avg"] = quant_fn(state["exp_avg"])
         if factored:
             state["exp_avg_sq_row"] = torch.zeros(grad_shape[:-1]).to(grad)
-            state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).to(grad)
+            state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).to(
+                grad
+            )
         else:
             state["exp_avg_sq"] = torch.zeros_like(grad)
             if group["quantization"]:
@@ -215,7 +237,13 @@ def flora_step_(optimizer: Optimizer, group: Dict, p: torch.Tensor, grad: Option
 
             update.copy_(
                 update * (1 - b1)
-                + _up_proj(seed=_current_seed, rank=group["rank"], shape=update.shape, ctensor=state["exp_avg"]) * b1
+                + _up_proj(
+                    seed=_current_seed,
+                    rank=group["rank"],
+                    shape=update.shape,
+                    ctensor=state["exp_avg"],
+                )
+                * b1
             )
 
             if state["step"] % group["kappa"] == 0:
@@ -225,7 +253,10 @@ def flora_step_(optimizer: Optimizer, group: Dict, p: torch.Tensor, grad: Option
                         seed=_next_seed,
                         rank=group["rank"],
                         tensor=_up_proj(
-                            seed=_current_seed, rank=group["rank"], shape=grad.shape, ctensor=state["exp_avg"]
+                            seed=_current_seed,
+                            rank=group["rank"],
+                            shape=grad.shape,
+                            ctensor=state["exp_avg"],
                         ),
                     )
                 )
@@ -233,7 +264,9 @@ def flora_step_(optimizer: Optimizer, group: Dict, p: torch.Tensor, grad: Option
                 _current_seed = _next_seed
 
             state["exp_avg"].copy_(
-                state["exp_avg"] * b1 + _down_proj(seed=_current_seed, rank=group["rank"], tensor=raw_update) * (1 - b1)
+                state["exp_avg"] * b1
+                + _down_proj(seed=_current_seed, rank=group["rank"], tensor=raw_update)
+                * (1 - b1)
             )
         if group["quantization"]:
             state["exp_avg"] = quant_fn(state["exp_avg"])
@@ -271,7 +304,9 @@ class Flora(Optimizer):
         quantization: bool = False,
     ) -> None:
         if lr is not None and relative_step:
-            raise ValueError("Cannot combine manual `lr` and `relative_step=True` options")
+            raise ValueError(
+                "Cannot combine manual `lr` and `relative_step=True` options"
+            )
         if warmup_init and not relative_step:
             raise ValueError("`warmup_init=True` requires `relative_step=True`")
 
@@ -303,7 +338,9 @@ class Flora(Optimizer):
     def _get_lr(param_group: Dict, param_state: Dict) -> float:
         rel_step_sz = param_group["lr"]
         if param_group["relative_step"]:
-            min_step = 1e-6 * param_state["step"] if param_group["warmup_init"] else 1e-2
+            min_step = (
+                1e-6 * param_state["step"] if param_group["warmup_init"] else 1e-2
+            )
             rel_step_sz = min(min_step, 1.0 / math.sqrt(param_state["step"]))
         param_scale = 1.0
         if param_group["scale_parameter"]:
@@ -311,7 +348,9 @@ class Flora(Optimizer):
         return param_scale * rel_step_sz
 
     @staticmethod
-    def _get_options(param_group: Dict, param_shape: tuple[int, ...]) -> tuple[bool, bool, bool]:
+    def _get_options(
+        param_group: Dict, param_shape: tuple[int, ...]
+    ) -> tuple[bool, bool, bool]:
         factored = len(param_shape) == 2 and param_group["factorize_second_moment"]
         use_first_moment = param_group["beta1"] is not None and param_group["beta1"] > 0
         factored_momentum = (
@@ -329,8 +368,14 @@ class Flora(Optimizer):
         return tensor.norm(2) / (tensor.numel() ** 0.5)
 
     @staticmethod
-    def _approx_sq_grad(exp_avg_sq_row: torch.Tensor, exp_avg_sq_col: torch.Tensor) -> torch.Tensor:
-        r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
+    def _approx_sq_grad(
+        exp_avg_sq_row: torch.Tensor, exp_avg_sq_col: torch.Tensor
+    ) -> torch.Tensor:
+        r_factor = (
+            (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True))
+            .rsqrt_()
+            .unsqueeze(-1)
+        )
         c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
         return torch.mul(r_factor, c_factor)
 
@@ -370,28 +415,45 @@ class FloraStrategyMixin:
     def _down_project(self, seed: int, grad: torch.Tensor) -> torch.Tensor:
         if grad.shape[0] < grad.shape[-1]:
             proj = stable_randn(
-                (self.proj_rank, grad.shape[0]), seed=seed, device=grad.device, dtype=grad.dtype
+                (self.proj_rank, grad.shape[0]),
+                seed=seed,
+                device=grad.device,
+                dtype=grad.dtype,
             ) / math.sqrt(self.proj_rank)
             return proj @ grad
         else:
             proj = stable_randn(
-                (grad.shape[-1], self.proj_rank), seed=seed, device=grad.device, dtype=grad.dtype
+                (grad.shape[-1], self.proj_rank),
+                seed=seed,
+                device=grad.device,
+                dtype=grad.dtype,
             ) / math.sqrt(self.proj_rank)
             return grad @ proj
 
-    def _up_project(self, seed: int, param: torch.Tensor, compressed_grad: torch.Tensor) -> torch.Tensor:
+    def _up_project(
+        self, seed: int, param: torch.Tensor, compressed_grad: torch.Tensor
+    ) -> torch.Tensor:
         if param.shape[0] < param.shape[-1]:
             proj = stable_randn(
-                (self.proj_rank, param.shape[0]), seed=seed, device=param.device, dtype=compressed_grad.dtype
+                (self.proj_rank, param.shape[0]),
+                seed=seed,
+                device=param.device,
+                dtype=compressed_grad.dtype,
             ) / math.sqrt(self.proj_rank)
             return proj.t() @ compressed_grad
         else:
             proj = stable_randn(
-                (param.shape[-1], self.proj_rank), seed=seed, device=param.device, dtype=compressed_grad.dtype
+                (param.shape[-1], self.proj_rank),
+                seed=seed,
+                device=param.device,
+                dtype=compressed_grad.dtype,
             ) / math.sqrt(self.proj_rank)
             return compressed_grad @ proj.t()
 
-def _setup_optimizer(strategy: FloraStrategyMixin, optimizer: Optimizer, device_placement: bool = None) -> Optimizer:
+
+def _setup_optimizer(
+    strategy: FloraStrategyMixin, optimizer: Optimizer, device_placement: bool = None
+) -> Optimizer:
     for group in optimizer.param_groups:
         for p in group["params"]:
             if not p.requires_grad:
@@ -403,37 +465,90 @@ def _setup_optimizer(strategy: FloraStrategyMixin, optimizer: Optimizer, device_
                 partial(with_flora_fabric(flora_step_), strategy, optimizer, group)
             )
     return super().setup_optimizer(optimizer, device_placement)
-        
+
+
 class FloraDDPStrategy(FloraStrategyMixin, strategies.DDPStrategy):
     """
     DDP strategy with Flora gradient accumulation compression.
     """
+
     def __init__(self, *args, accumulation_rank: int = None, **kwargs):
         super().__init__(*args, accumulation_rank=accumulation_rank, **kwargs)
 
-    def setup_optimizer(self, optimizer: Optimizer, device_placement: bool = None) -> Optimizer:
+    def setup_optimizer(
+        self, optimizer: Optimizer, device_placement: bool = None
+    ) -> Optimizer:
         return _setup_optimizer(self, optimizer, device_placement)
+    
+    @classmethod
+    @override
+    def register_strategies(cls, strategy_registry: strategies._StrategyRegistry) -> None:
+        if not torch.distributed.is_available():
+            return
+
+        strategy_registry.register(
+            "flora-ddp",
+            cls,
+            description="Flora DDP training",
+        )
+        strategy_registry.register(
+            "flora-ddp-cpu-offload",
+            cls,
+            description="Flora DDP training with CPU Offloading",
+            cpu_offload=True,
+        )
+
 
 class FloraFSDPStrategy(FloraStrategyMixin, strategies.FSDPStrategy):
     """
     FSDP strategy with Flora gradient accumulation compression.
     """
+
     def __init__(self, *args, accumulation_rank: int = None, **kwargs):
         super().__init__(*args, accumulation_rank=accumulation_rank, **kwargs)
 
-    def setup_optimizer(self, optimizer: Optimizer, device_placement: bool = None) -> Optimizer:
+    def setup_optimizer(
+        self, optimizer: Optimizer, device_placement: bool = None
+    ) -> Optimizer:
         return _setup_optimizer(self, optimizer, device_placement)
+    
+    @classmethod
+    @override
+    def register_strategies(cls, strategy_registry: strategies._StrategyRegistry) -> None:
+        if not torch.distributed.is_available():
+            return
+
+        strategy_registry.register(
+            "flora-fsdp",
+            cls,
+            description="Flora FSDP training",
+        )
+        strategy_registry.register(
+            "flora-fsdp-cpu-offload",
+            cls,
+            description="Flora FSDP training with CPU Offloading",
+            cpu_offload=True,
+        )
+
 
 class FloraSingleDeviceStrategy(FloraStrategyMixin, strategies.SingleDeviceStrategy):
     """
     Single device strategy with Flora gradient accumulation compression.
     """
+
     def __init__(self, *args, accumulation_rank: int = None, **kwargs):
         super().__init__(*args, accumulation_rank=accumulation_rank, **kwargs)
 
-    def setup_optimizer(self, optimizer: Optimizer, device_placement: bool = None) -> Optimizer:
+    def setup_optimizer(
+        self, optimizer: Optimizer, device_placement: bool = None
+    ) -> Optimizer:
         return _setup_optimizer(self, optimizer, device_placement)
     
-strategies.register_strategy("flora-ddp", FloraDDPStrategy)
-strategies.register_strategy("flora-fsdp", FloraFSDPStrategy)
-strategies.register_strategy("flora-single-device", FloraSingleDeviceStrategy)
+    @classmethod
+    @override
+    def register_strategies(cls, strategy_registry: strategies._StrategyRegistry) -> None:
+        strategy_registry.register(
+            "flora-single-device",
+            cls,
+            description="Flora single device training",
+        )

@@ -1,15 +1,16 @@
-__target__: mone_pytorch.optimizer.flora.FloraOptimizer
-lr: float = 1e-3
-rank: int = None,  # rank of the low-rank random projections
-kappa: int = 1000,  # the interval for updating the low-rank random projections
-eps: tuple[float, float] = (1e-30, 1e-3),  # Adafactor parameter
-clip_threshold: float = 1.0,  # Adafactor parameter
-decay_rate: float = -0.8,  # decay rate in Adafactor
-beta1: Optional[float] = None,  # decay rate for the first moment
-weight_decay: float = 0.0,  # weight decay coefficient
-scale_parameter: bool = True,  # Adafactor parameter
-relative_step: bool = False,  # Adafactor parameter
-warmup_init: bool = False,  # Adafactor parameter
-factorize_second_moment: bool = True,  # use Adafactor or Adam
-seed: int = 0,  # random seed to generate the low-rank random projections
-quantization: bool = False,  # whether to quantize the states
+name: Flora
+hparams:
+  lr: float = 1e-3
+  rank: int = None,  # rank of the low-rank random projections
+  kappa: int = 1000,  # the interval for updating the low-rank random projections
+  eps: tuple[float, float] = (1e-30, 1e-3),  # Adafactor parameter
+  clip_threshold: float = 1.0,  # Adafactor parameter
+  decay_rate: float = -0.8,  # decay rate in Adafactor
+  beta1: Optional[float] = None,  # decay rate for the first moment
+  weight_decay: float = 0.0,  # weight decay coefficient
+  scale_parameter: bool = True,  # Adafactor parameter
+  relative_step: bool = False,  # Adafactor parameter
+  warmup_init: bool = False,  # Adafactor parameter
+  factorize_second_moment: bool = True,  # use Adafactor or Adam
+  seed: int = 0,  # random seed to generate the low-rank random projections
+  quantization: bool = False,  # whether to quantize the states

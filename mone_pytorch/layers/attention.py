@@ -4,7 +4,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Optional
 from .nested_linear import NestedLinearExpand, NestedLinearContract
 
 
@@ -19,20 +19,20 @@ class NestedAttention(nn.Module):
         num_heads: int = 8,
         num_experts: int = 4,
         qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
     ) -> None:
         super().__init__()
         self.dim = dim
-        self.num_experts = len(dim)
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.scale = head_dim**-0.5 if qk_scale is None else qk_scale
 
-        self.qkv = NestedLinearExpand(dim, dim * 3, num_experts, bias=qkv_bias)
+        self.qkv = NestedLinearExpand(dim, dim * 3, qkv_bias, num_experts)
         self.attn_drop = attn_drop
-        self.proj = NestedLinearContract(dim, dim, num_experts, bias=proj_bias)
+        self.proj = NestedLinearContract(dim, dim, proj_bias, num_experts)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
