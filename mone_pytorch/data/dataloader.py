@@ -19,23 +19,23 @@ def build_dataloaders(cfg):
     if 'imagenet1k' == cfg.data.dataset_name:
         # Create datasets
         train_dataset = ImageNet(
-            root=cfg.data.imagenet1k.train_path,
+            root=cfg.data.train_path,
             split="train",
             transform=train_augmentation
         )
     
         val_dataset = ImageNet(
-            root=cfg.data.imagenet1k.val_path,
+            root=cfg.data.val_path,
             split="val",
             transform=val_augmentation
         )
     elif 'imagenet21k' == cfg.data.dataset_name:
         train_dataset = ImageFolder(
-            root=cfg.data.imagenet21k.train_path,
+            root=cfg.data.train_path,
             transform=train_augmentation
         )
         val_dataset = ImageFolder(
-            root=cfg.data.imagenet21k.val_path,
+            root=cfg.data.val_path,
             transform=val_augmentation
         )
     else:

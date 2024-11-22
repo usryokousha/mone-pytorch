@@ -7,19 +7,6 @@ import torch.nn.functional as F
 
 from .nested_linear import NestedLinearExpand, NestedLinearContract
 
-XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
-try:
-    if XFORMERS_ENABLED:
-        from xformers.ops import memory_efficient_attention, unbind
-
-        XFORMERS_AVAILABLE = True
-        warnings.warn("xFormers is available (Attention)")
-    else:
-        warnings.warn("xFormers is disabled (Attention)")
-        raise ImportError
-except ImportError:
-    XFORMERS_AVAILABLE = False
-    warnings.warn("xFormers is not available (Attention)")
 
 class NestedAttention(nn.Module):
     """
@@ -44,26 +31,22 @@ class NestedAttention(nn.Module):
         self.scale = head_dim**-0.5
 
         self.qkv = NestedLinearExpand(dim, dim * 3, num_experts, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_drop = attn_drop
         self.proj = NestedLinearContract(dim, dim, num_experts, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
-        self, input_tokens: torch.Tensor, expert_mask: torch.Tensor, attn_bias=None
+        self, input_tokens: torch.Tensor, expert_mask: torch.Tensor
     ) -> torch.Tensor:
         B, N, _ = input_tokens.shape
 
         qkv = self.qkv(input_tokens, expert_mask)
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.dim // self.num_heads)
 
-        if XFORMERS_AVAILABLE:
-            q, k, v = unbind(qkv, dim=2)
-            x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
-        else:
-            q, k, v = qkv.unbind(dim=-3)
-            if attn_bias is not None:
-                raise ValueError("Only support xFormers for now")
-            x = F.scaled_dot_product_attention(q, k, v)
+        q, k, v = qkv.unbind(dim=-3)
+        x = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_drop, scale=self.scale
+        )
 
         x = x.reshape([B, N, self.dim])
         x = self.proj(x, expert_mask)
