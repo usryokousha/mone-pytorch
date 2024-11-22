@@ -10,7 +10,26 @@ import torch.nn as nn
 
 from mone_pytorch.layers.patch_embed import PatchEmbed
 from mone_pytorch.layers.block import NestedBlock
-from mone_pytorch.layers.feedforward import NestedFeedForward
+from mone_pytorch.layers.feedforward import NestedFeedForward, NestedSwiGLUFeedForward
+from mone_pytorch.layers.routing import ExpertPreferredRouter, ConditionedEPR
+
+router_module = {
+    "epr": ExpertPreferredRouter,
+    "cepr": ConditionedEPR,
+}
+
+ffn_module = {
+    "ffn": NestedFeedForward,
+    "swiglu": NestedSwiGLUFeedForward,
+}
+
+
+def nested_vit(router_type: str = "epr", ffn_type: str = "ffn", **kwargs):
+    return NestedVisionTransformer(
+        router_module=router_module[router_type],
+        ffn_module=ffn_module[ffn_type],
+        **kwargs
+    )
 
 
 class NestedVisionTransformer(nn.Module):
@@ -25,7 +44,7 @@ class NestedVisionTransformer(nn.Module):
         embed_dim=768,
         depth=12,
         num_experts=4,
-        capacity_dist=[1.0],
+        capacity_dist=[1.0, 0.0, 0.0, 0.0],
         num_routers=1,
         num_heads=12,
         mlp_ratio=4.0,
@@ -38,9 +57,12 @@ class NestedVisionTransformer(nn.Module):
         router_noise=0.0,
         norm_layer=nn.LayerNorm,
         ffn_layer=NestedFeedForward,
+        router_layer=ExpertPreferredRouter,
         **kwargs
     ):
         super().__init__()
+        assert len(capacity_dist) == num_experts, \
+            "Capacity distribution must be of length num_experts"
         self.num_features = self.embed_dim = embed_dim
 
         self.patch_embed = PatchEmbed(
@@ -73,6 +95,7 @@ class NestedVisionTransformer(nn.Module):
                     ffn_layer=ffn_layer,
                     norm_layer=norm_layer,
                     jitter_noise=router_noise,
+                    router_layer=router_layer,
                 )
             )
 
@@ -141,63 +164,3 @@ class NestedVisionTransformer(nn.Module):
         x = self.norm(x)
         # global average pooling
         return self.head(x.mean(dim=1))
-
-
-def nested_vit_small(patch_size=16, **kwargs):
-    return NestedVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=384,
-        depth=12,
-        num_heads=6,
-        mlp_ratio=4,
-        qkv_bias=True,
-        **kwargs
-    )
-
-
-def nested_vit_base(patch_size=16, **kwargs):
-    return NestedVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=768,
-        depth=12,
-        num_heads=12,
-        mlp_ratio=4,
-        qkv_bias=True,
-        **kwargs
-    )
-
-
-def nested_vit_large(patch_size=16, **kwargs):
-    return NestedVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        mlp_ratio=4,
-        qkv_bias=True,
-        **kwargs
-    )
-
-
-def nested_vit_huge(patch_size=16, **kwargs):
-    return NestedVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1536,
-        depth=32,
-        num_heads=24,
-        mlp_ratio=4,
-        qkv_bias=True,
-        **kwargs
-    )
-
-
-def nested_vit_giant(patch_size=16, **kwargs):
-    return NestedVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=2048,
-        depth=48,
-        num_heads=32,
-        mlp_ratio=4,
-        qkv_bias=True,
-        **kwargs
-    )

@@ -1,4 +1,4 @@
-_target_: mone_pytorch.models.NestedVisionTransformer
+_target_: mone_pytorch.models.nested_vit
 embed_dim: 2048
 depth: 48
 num_heads: 32
@@ -6,9 +6,9 @@ mlp_ratio: 4
 qkv_bias: true
 patch_size: 16
 img_size: 224
-num_register_tokens: 0
 num_classes: ${data.num_classes}
 
 # Additional model parameters
 num_routers: 1
-capacity_distribution: null
+router_type: epr
+ffn_type: ffn

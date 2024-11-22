@@ -2,14 +2,14 @@ import math
 import hydra
 import torch
 import torch.nn as nn
-
+from lightning import Fabric
 from torch.optim.lr_scheduler import LambdaLR
 from omegaconf import DictConfig
 from typing import List, Dict, Any
 
 
-def scale_lr(lr: float, batch_size: int, grad_accum: int) -> float:
-    return lr * batch_size * grad_accum / 256
+def scale_lr(lr: float, batch_size: int, grad_accum: int, num_gpus: int) -> float:
+    return lr * batch_size * grad_accum * num_gpus / 256
 
 
 def group_params(
@@ -57,6 +57,7 @@ def group_params(
     ]
     return optim_groups
 
+
 # adapted from Torchtune implementation
 def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,
@@ -85,8 +86,9 @@ def get_cosine_schedule_with_warmup(
 
 
 def build_optimizer(
-    model: nn.Module,
     cfg: DictConfig,
+    model: nn.Module,
+    num_processes: int,
 ) -> torch.optim.Optimizer:
     """
     Build optimizer with parameter groups.
@@ -107,7 +109,12 @@ def build_optimizer(
 
     # Initialize optimizer and scale learning rate
     optimizer = hydra.utils.instantiate(cfg.optimizer, params=param_groups)
-    optimizer.param_groups[0]['lr'] = scale_lr(cfg.optimizer.lr, cfg.train.batch_size, cfg.gradient_accumulation)
+    optimizer.param_groups[0]["lr"] = scale_lr(
+        cfg.optimizer.lr,
+        cfg.train.batch_size,
+        cfg.gradient_accumulation,
+        num_processes,
+    )
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,

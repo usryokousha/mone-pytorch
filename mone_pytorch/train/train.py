@@ -8,7 +8,7 @@ from torch.optim.swa_utils import get_ema_multi_avg_fn, AveragedModel
 from fvcore.nn.flop_count import flop_count
 
 from mone_pytorch.data.dataloader import build_dataloaders
-from mone_pytorch.train.initialize import initialize_mone_model
+from mone_pytorch.train.initialize import initialize_model
 from mone_pytorch.utils.optimizer import build_optimizer
 from mone_pytorch.utils.augmentation import CutMixup
 
@@ -163,13 +163,13 @@ def main(cfg: DictConfig):
     fabric.launch()
 
     # Get dataloaders and augmentation
-    train_loader, val_loader, augmentation = build_dataloaders(cfg)
+    train_loader, val_loader = build_dataloaders(cfg)
     
     # Create model with MoNE initialization
-    model = initialize_mone_model(cfg, fabric)
+    model = initialize_model(cfg, fabric)
     
     # Create optimizer and scheduler
-    optimizer, scheduler = build_optimizer(model, cfg)
+    optimizer, scheduler = build_optimizer(cfg, model, fabric.num_processes)
     
     # Setup with Fabric
     model, optimizer = fabric.setup(model, optimizer)
@@ -227,7 +227,6 @@ def main(cfg: DictConfig):
             train_loader=train_loader,
             optimizer=optimizer,
             scheduler=scheduler,
-            augmentation=augmentation,
             metrics=metrics,  # Pass metrics to train_one_epoch
             cfg=cfg,
             epoch=epoch

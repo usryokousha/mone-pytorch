@@ -59,4 +59,4 @@ def build_dataloaders(cfg):
         pin_memory=True
     )
 
-    return train_loader, val_loader, augmentation 
+    return train_loader, val_loader
