@@ -8,6 +8,7 @@ defaults:
   - logging:
     - csv_logger
     - wandb
+  - scheduler: default
   - _self_
 
 seed: 42

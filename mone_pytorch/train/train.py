@@ -177,10 +177,10 @@ def main(cfg: DictConfig):
     train_loader, val_loader = fabric.setup_dataloaders(train_loader, val_loader)
 
     # apply EMA optionally
-    if cfg.ema.enabled:
-        ema_avg_fn = get_ema_multi_avg_fn(cfg.ema.decay)
+    if cfg.training.ema.enabled:
+        ema_avg_fn = get_ema_multi_avg_fn(cfg.training.ema.decay)
         ema_model = AveragedModel(model.module, avg_fn=ema_avg_fn)
-        fabric.print(f"Using EMA with decay {cfg.ema.decay}")
+        fabric.print(f"Using EMA with decay {cfg.training.ema.decay}")
     else:
         ema_model = None
 
