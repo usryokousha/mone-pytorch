@@ -1,4 +1,4 @@
-_target_: mone_pytorch.models.nested_vit
+name: nested-vit-giant
 embed_dim: 2048
 depth: 48
 num_heads: 32

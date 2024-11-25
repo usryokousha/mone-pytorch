@@ -35,4 +35,6 @@ def initialize_model(cfg: DictConfig, fabric: Fabric):
         ffn_type=cfg.model.ffn_type,
     )
 
+    fabric.print(f"{cfg.model.name} model initialized")
+
     return model

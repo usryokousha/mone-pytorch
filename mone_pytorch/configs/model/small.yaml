@@ -1,4 +1,4 @@
-_target_: mone_pytorch.models.NestedVisionTransformer
+name: nested-vit-small
 embed_dim: 384
 depth: 12
 num_heads: 6
