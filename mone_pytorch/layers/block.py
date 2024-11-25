@@ -2,13 +2,13 @@
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from mone_pytorch.layers.feedforward import NestedFeedForward, NestedSwiGLUFeedForward
-from mone_pytorch.layers.attention import NestedAttention
+from mone_pytorch.layers.attention import NestedAttention, _attention
+from mone_pytorch.layers.nested_linear import NestedLinearExpand
 from mone_pytorch.layers import routing
 
 from typing import Optional, List, Callable
-
 
 class NestedBlock(nn.Module):
     def __init__(
@@ -40,7 +40,13 @@ class NestedBlock(nn.Module):
         if capacity_dist is not None:
             self.router = router_layer(dim, capacity_dist)
         self.attention = NestedAttention(
-            dim, num_heads, num_experts, qkv_bias, proj_bias, qk_scale, attn_drop=attn_drop
+            dim,
+            num_heads,
+            num_experts,
+            qkv_bias,
+            proj_bias,
+            qk_scale,
+            attn_drop=attn_drop,
         )
         self.norm2 = norm_layer(dim)
         self.mlp = ffn_layer(
@@ -57,22 +63,23 @@ class NestedBlock(nn.Module):
         self,
         x: torch.Tensor,
         expert_mask: Optional[torch.Tensor] = None,
-        router_weights: Optional[torch.Tensor] = None,
+        router_probs: Optional[torch.Tensor] = None,
         jitter_noise: float = 0.0,
     ) -> torch.Tensor:
         if self.router is not None:
-            expert_mask, router_weights = self.router(x, router_weights, jitter_noise)
+            expert_mask, router_probs = self.router(x, router_probs, jitter_noise)
         else:
-            router_weights = None
+            router_probs = None
 
-        if isinstance(self.router, routing.ConditionedEPR):
-            router_probs = self.router.get_expert_probs(router_weights, expert_mask)
-        else:
-            router_probs = router_weights
+        expert_probs = self.router.get_expert_probs(router_probs, expert_mask)
 
         # As described in the paper
         z = x + self.attention(self.norm1(x), expert_mask)
         z_prime = self.mlp(self.norm2(z), expert_mask)
 
-        output_tokens = z + (self.alpha * router_probs + 1) * z_prime
-        return output_tokens, expert_mask, router_weights
+        output_tokens = z + (self.alpha * expert_probs + 1) * z_prime
+        return output_tokens, expert_mask, router_probs
+
+# TODO: possibly implement a parallel version of the block
+
+

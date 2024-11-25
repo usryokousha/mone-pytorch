@@ -8,6 +8,21 @@ from typing import Optional
 from .nested_linear import NestedLinearExpand, NestedLinearContract
 
 
+def _attention(
+    qkv: torch.Tensor,
+    num_heads: int,
+    dim: int,
+    attn_drop: float,
+    scale: float,
+) -> torch.Tensor:
+    B, N, _ = qkv.shape
+    qkv = qkv.reshape(B, N, 3, num_heads, dim // num_heads)
+    q, k, v = qkv.unbind(dim=-3)
+    x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_drop, scale=scale)
+    x = x.reshape([B, N, dim])
+    return x
+
+
 class NestedAttention(nn.Module):
     """
     Nested Attention layer with token-wise expert assignment.
@@ -41,14 +56,7 @@ class NestedAttention(nn.Module):
         B, N, _ = input_tokens.shape
 
         qkv = self.qkv(input_tokens, expert_mask)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.dim // self.num_heads)
-
-        q, k, v = qkv.unbind(dim=-3)
-        x = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.attn_drop, scale=self.scale
-        )
-
-        x = x.reshape([B, N, self.dim])
+        x = _attention(qkv, self.num_heads, self.dim, self.attn_drop, self.scale)
         x = self.proj(x, expert_mask)
         x = self.proj_drop(x)
 
