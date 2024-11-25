@@ -9,15 +9,18 @@ from .nested_linear import NestedLinearExpand, NestedLinearContract
 
 
 def _attention(
-    qkv: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     num_heads: int,
     dim: int,
     attn_drop: float,
     scale: float,
 ) -> torch.Tensor:
-    B, N, _ = qkv.shape
-    qkv = qkv.reshape(B, N, 3, num_heads, dim // num_heads)
-    q, k, v = qkv.unbind(dim=-3)
+    B, N, _ = q.shape
+    q = q.reshape(B, N, num_heads, dim // num_heads)
+    k = k.reshape(B, N, num_heads, dim // num_heads)
+    v = v.reshape(B, N, num_heads, dim // num_heads)
     x = F.scaled_dot_product_attention(q, k, v, dropout_p=attn_drop, scale=scale)
     x = x.reshape([B, N, dim])
     return x
@@ -56,7 +59,8 @@ class NestedAttention(nn.Module):
         B, N, _ = input_tokens.shape
 
         qkv = self.qkv(input_tokens, expert_mask)
-        x = _attention(qkv, self.num_heads, self.dim, self.attn_drop, self.scale)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        x = _attention(q, k, v, self.num_heads, self.dim, self.attn_drop, self.scale)
         x = self.proj(x, expert_mask)
         x = self.proj_drop(x)
 
