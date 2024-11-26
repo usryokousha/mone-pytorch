@@ -68,21 +68,22 @@ class NestedBlock(nn.Module):
         x: torch.Tensor,
         expert_mask: Optional[torch.Tensor] = None,
         router_probs: Optional[torch.Tensor] = None,
+        router_logits: Optional[torch.Tensor] = None,
         jitter_noise: float = 0.0,
     ) -> torch.Tensor:
         if self.router is not None:
-            expert_mask, router_probs = self.router(x, router_probs, jitter_noise)
-        else:
-            router_probs = None
-
-        expert_probs = self.router.get_expert_probs(router_probs, expert_mask)
+            expert_mask, expert_probs, router_logits = self.router(x, router_logits, jitter_noise)
+        elif router_logits is not None:
+            expert_probs = routing.ExpertPreferredRouter.get_expert_probs(
+                F.softmax(router_logits, dim=-1), expert_mask
+            )
 
         # As described in the paper
         z = x + self.attention(self.norm1(x), expert_mask)
         z_prime = self.mlp(self.norm2(z), expert_mask)
 
         output_tokens = z + (self.alpha * expert_probs + 1) * z_prime
-        return output_tokens, expert_mask, router_probs
+        return output_tokens, expert_mask, router_probs, router_logits
 
 
 # TODO: possibly implement a parallel version of the block
@@ -134,14 +135,18 @@ class NestedParallelBlock(nn.Module):
         x: torch.Tensor,
         expert_mask: Optional[torch.Tensor] = None,
         router_probs: Optional[torch.Tensor] = None,
+        router_logits: Optional[torch.Tensor] = None,
         jitter_noise: float = 0.0,
     ) -> torch.Tensor:
         residual = x
         if self.router is not None:
-            expert_mask, router_probs = self.router(x, router_probs, jitter_noise)
-        else:
+            expert_mask, router_probs, router_logits = self.router(x, router_logits, jitter_noise)
+        elif router_logits is not None:
+            expert_probs = routing.ExpertPreferredRouter.get_expert_probs(
+                F.softmax(router_logits, dim=-1), expert_mask
+            )   
             router_probs = None
-        expert_probs = self.router.get_expert_probs(router_probs, expert_mask)
+
         qkv, mlp_hidden = torch.split(
             nested_linear_expand(self.norm1(x), self.expand_weight, expert_mask, None),
             [3 * self.dim, self.mlp_ratio * self.dim],
@@ -162,4 +167,4 @@ class NestedParallelBlock(nn.Module):
         )
         attn_output = attn_output + residual
         output = attn_output + (self.alpha * expert_probs + 1) * mlp_output
-        return output, expert_mask, router_probs
+        return output, expert_mask, router_probs, router_logits
