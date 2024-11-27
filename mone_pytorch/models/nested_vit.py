@@ -10,24 +10,24 @@ import torch.nn as nn
 
 from mone_pytorch.layers.patch_embed import PatchEmbed
 from mone_pytorch.layers.block import NestedBlock
-from mone_pytorch.layers.feedforward import NestedFeedForward, NestedSwiGLUFeedForward
-from mone_pytorch.layers.routing import ExpertPreferredRouter, ConditionedEPR
+from mone_pytorch.layers.mlp import NestedMLP, NestedSwiGLUMLP
+from mone_pytorch.layers.routing import EPR, CEPR
 
 router_module = {
-    "epr": ExpertPreferredRouter,
-    "cepr": ConditionedEPR,
+    "epr": EPR,
+    "cepr": CEPR,
 }
 
-ffn_module = {
-    "ffn": NestedFeedForward,
-    "swiglu": NestedSwiGLUFeedForward,
+mlp_module = {
+    "mlp": NestedMLP,
+    "swiglu": NestedSwiGLUMLP,
 }
 
 
-def nested_vit(router_type: str = "epr", ffn_type: str = "ffn", **kwargs):
+def nested_vit(router_type: str = "epr", mlp_type: str = "mlp", **kwargs):
     return NestedVisionTransformer(
         router_module=router_module[router_type],
-        ffn_module=ffn_module[ffn_type],
+        mlp_module=mlp_module[mlp_type],
         **kwargs
     )
 
@@ -50,18 +50,19 @@ class NestedVisionTransformer(nn.Module):
         mlp_ratio=4.0,
         qkv_bias=True,
         proj_bias=True,
-        ffn_bias=True,
+        mlp_bias=True,
         qk_scale=None,
         drop_rate=0.0,
         attn_drop_rate=0.0,
         norm_layer=nn.LayerNorm,
-        ffn_layer=NestedFeedForward,
-        router_layer=ExpertPreferredRouter,
+        mlp_layer=NestedMLP,
+        router_layer=EPR,
         **kwargs
     ):
         super().__init__()
-        assert len(capacity_dist) == num_experts, \
-            "Capacity distribution must be of length num_experts"
+        assert (
+            len(capacity_dist) == num_experts
+        ), "Capacity distribution must be of length num_experts"
         self.num_features = self.embed_dim = embed_dim
 
         self.patch_embed = PatchEmbed(
@@ -75,9 +76,12 @@ class NestedVisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.blocks = nn.ModuleList([])
-        blocks_per_router = depth // num_routers
+        self.routers = nn.ModuleList([])
+        self.blocks_per_router = depth // num_routers
         for i in range(depth):
-            add_router = i % blocks_per_router == 0
+            add_router = i % self.blocks_per_router == 0
+            if add_router:
+                self.routers.append(router_layer(embed_dim, capacity_dist, dtype=torch.float32))
             self.blocks.append(
                 NestedBlock(
                     dim=embed_dim,
@@ -85,13 +89,13 @@ class NestedVisionTransformer(nn.Module):
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
-                    ffn_bias=ffn_bias,
+                    mlp_bias=mlp_bias,
                     qk_scale=qk_scale,
                     proj_drop=drop_rate,
                     attn_drop=attn_drop_rate,
                     num_experts=num_experts,
                     capacity_dist=capacity_dist if add_router else None,
-                    ffn_layer=ffn_layer,
+                    mlp_layer=mlp_layer,
                     norm_layer=norm_layer,
                     router_layer=router_layer,
                 )
@@ -155,10 +159,13 @@ class NestedVisionTransformer(nn.Module):
         x = self.prepare_tokens(x)
         expert_mask = None
         router_probs = None
-        for blk in self.blocks:
-            x, expert_mask, router_probs = blk(
-                x, expert_mask, router_probs, jitter_noise
-            )
+        router_logits = None
+        for i, blk in enumerate(self.blocks):
+            if i % self.blocks_per_router == 0:
+                expert_mask, router_probs, router_logits = self.routers[
+                    i // self.blocks_per_router
+                ](x, router_logits, jitter_noise)
+            x = blk(x, expert_mask, router_probs)
         x = self.norm(x)
         # global average pooling
         return self.head(x.mean(dim=1))

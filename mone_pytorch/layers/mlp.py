@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .nested_linear import nested_feedforward, nested_feedforward_swiglu
+from .nested_linear import nested_mlp, nested_swiglu_mlp
 
 from typing import Optional, Callable
 
 
-class NestedFeedForward(nn.Module):
+class NestedMLP(nn.Module):
     """
-    Nested FeedForward layer with token-wise expert assignment.
+    Nested MLP layer with token-wise expert assignment.
     """
 
     def __init__(
@@ -32,7 +32,7 @@ class NestedFeedForward(nn.Module):
         self.drop_rate = drop_rate
 
     def forward(self, x: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
-        x = nested_feedforward(
+        x = nested_mlp(
             x,
             self.proj1.weight,
             self.proj2.weight,
@@ -47,9 +47,9 @@ class NestedFeedForward(nn.Module):
         return x
 
 
-class NestedSwiGLUFeedForward(nn.Module):
+class NestedSwiGLUMLP(nn.Module):
     """
-    Nested SwiGLU FeedForward layer with token-wise expert assignment.
+    Nested SwiGLU MLP layer with token-wise expert assignment.
     """
 
     def __init__(
@@ -70,7 +70,7 @@ class NestedSwiGLUFeedForward(nn.Module):
         self.proj2 = nn.Linear(in_features * mlp_ratio, out_features, bias=bias)
 
     def forward(self, x: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
-        x = nested_feedforward_swiglu(
+        x = nested_swiglu_mlp(
             x,
             self.proj1.weight,
             self.proj2.weight,

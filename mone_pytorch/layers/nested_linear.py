@@ -112,7 +112,7 @@ def nested_linear_contract(
     return output.reshape(input_shape[:-1] + (out_dim,))
 
 @torch.compile
-def nested_feedforward(
+def nested_mlp(
     x: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -124,7 +124,7 @@ def nested_feedforward(
     num_experts: int = 4,
     training: bool = True,
 ) -> torch.Tensor:
-    """More efficient implementation of nested feedforward"""
+    """More efficient implementation of nested MLP"""
     in_dim = w1.shape[1]
     out_dim = w2.shape[0]
     input_shape = x.shape
@@ -153,7 +153,7 @@ def nested_feedforward(
     return output.reshape(input_shape[:-1] + (out_dim,))
 
 @torch.compile
-def nested_feedforward_swiglu(
+def nested_swiglu_mlp(
     x: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -162,7 +162,7 @@ def nested_feedforward_swiglu(
     b2: Optional[torch.Tensor] = None,
     num_experts: int = 4,
 ) -> torch.Tensor:
-    """More efficient implementation of nested feedforward with SwiGLU"""
+    """More efficient implementation of nested MLP with SwiGLU"""
     in_dim = w1.shape[1]
     out_dim = w2.shape[0]
     input_shape = x.shape

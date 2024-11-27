@@ -11,7 +11,13 @@ from typing import List, Tuple
 """Implementation of the routing algorithm for the MONE model."""
 
 
-class ExpertPreferredRouter(nn.Module):
+def get_expert_probs(router_probs: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    """Get probabilities for assigned experts based on logits and token mask"""
+    expert_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
+    return expert_probs
+
+
+class EPR(nn.Module):
     """
     Expert Preferred Router for the MONE model.
 
@@ -119,12 +125,6 @@ class ExpertPreferredRouter(nn.Module):
 
         return token_mask
 
-    @classmethod
-    def get_expert_probs(cls, router_probs: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
-        """Get probabilities for assigned experts based on logits and token mask"""
-        expert_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
-        return expert_probs
-
     def forward(
         self, input_tokens: torch.Tensor, prev_logits: torch.Tensor = None, jitter_noise: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -140,12 +140,12 @@ class ExpertPreferredRouter(nn.Module):
         # Assign tokens to experts
         token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
 
-        expert_probs = self.get_expert_probs(router_probs, token_mask)
+        expert_probs = get_expert_probs(router_probs, token_mask)
 
         return token_mask, expert_probs.to(dtype), None
 
 
-class ConditionedEPR(ExpertPreferredRouter):
+class CEPR(EPR):
     """
     Conditioned Expert Preferred Router for the MONE model.
     Extends ExpertPreferredRouter to condition routing decisions on previous layer logits.
@@ -194,7 +194,7 @@ class ConditionedEPR(ExpertPreferredRouter):
         # Assign tokens to experts
         token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
 
-        expert_probs = self.get_expert_probs(router_probs, token_mask)
+        expert_probs = get_expert_probs(router_probs, token_mask)
 
         return token_mask, expert_probs.to(dtype), router_logits.to(dtype)
 
