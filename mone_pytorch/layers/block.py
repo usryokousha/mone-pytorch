@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mone_pytorch.layers.mlp import NestedMLP, NestedSwiGLUMLP
+from mone_pytorch.layers.mlp import NestedMLP
 from mone_pytorch.layers.attention import NestedAttention, _attention
 from mone_pytorch.layers.nested_linear import (
     nested_linear_expand,
@@ -13,7 +13,7 @@ from mone_pytorch.layers.nested_linear import (
 from typing import Optional, List, Callable
 
 
-class NestedBlock(nn.Module):
+class NestedSequentialBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -134,10 +134,17 @@ class NestedParallelBlock(nn.Module):
                 dim=-1,
             )
         else:
-            input_bias = torch.cat([self.mlp_bias, self.qkv_bias], dim=-1)
+            input_bias = torch.cat(
+                [self.mlp_bias, 
+                 self.qkv_bias], 
+                dim=-1
+            )
         qkv, mlp_hidden = torch.split(
             nested_linear_expand(
-                self.norm1(x), self.expand_weight, expert_mask, input_bias
+                self.norm1(x), 
+                self.expand_weight, 
+                expert_mask, 
+                input_bias
             ),
             [3 * self.dim, self.mlp_ratio * self.dim],
             dim=-1,
@@ -146,11 +153,19 @@ class NestedParallelBlock(nn.Module):
         q, kv = torch.chunk(qkv, 2, dim=-1)
         k, v = torch.chunk(self.norm2(kv), 2, dim=-1)
         attn_output = _attention(
-            q, k, v, self.num_heads, self.dim, self.attn_drop, self.scale
+            q, 
+            k, 
+            v, 
+            self.num_heads, 
+            self.dim, 
+            self.attn_drop, 
+            self.scale
         )
         attn_output, mlp_output = torch.chunk(
             nested_linear_contract(
-                torch.cat((attn_output, self.act_layer(mlp_hidden)), dim=-1),
+                torch.cat([attn_output, 
+                           self.act_layer(mlp_hidden)], 
+                          dim=-1),
                 self.contract_weight,
                 self.contract_bias,
             ),

@@ -142,61 +142,7 @@ class EPR(nn.Module):
 
         expert_probs = get_expert_probs(router_probs, token_mask)
 
-        return token_mask, expert_probs.to(dtype), None
-
-
-class CEPR(EPR):
-    """
-    Conditioned Expert Preferred Router for the MONE model.
-    Extends ExpertPreferredRouter to condition routing decisions on previous layer logits.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Additional projection for concatenated logits
-        self.cond_proj = nn.Linear(
-            2 * self.num_experts, self.num_experts, dtype=self.dtype
-        )
-
-    def _compute_router_probs(
-        self, input_tokens: torch.Tensor, prev_logits: torch.Tensor = None, jitter_noise: float = 0.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Get initial logits from input tokens
-        logits = self.router(input_tokens)  # [batch_size, num_tokens, num_experts]
-
-        # add jitter noise if specified
-        if jitter_noise > 0:
-            logits = logits + torch.randn_like(logits) * jitter_noise
-
-        if prev_logits is not None:
-            # Get conditional probabilities with numerically stable softmax
-            logits = torch.cat([logits, prev_logits], dim=-1)
-
-        probs = F.softmax(logits, dim=-1)
-
-        return probs, logits
-
-    def forward(
-        self,
-        input_tokens: torch.Tensor,
-        prev_logits: torch.Tensor = None,
-        jitter_noise: float = 0.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_tokens, dim = input_tokens.shape
-        device = input_tokens.device
-        dtype = input_tokens.dtype
-
-        # Get router probabilities
-        router_probs, router_logits = self._compute_router_probs(
-            input_tokens.to(self.dtype), prev_logits, jitter_noise
-        )
-
-        # Assign tokens to experts
-        token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
-
-        expert_probs = get_expert_probs(router_probs, token_mask)
-
-        return token_mask, expert_probs.to(dtype), router_logits.to(dtype)
+        return token_mask, expert_probs.to(dtype)
 
 
 class NestedCombine(nn.Module):

@@ -9,7 +9,13 @@ from typing import Optional
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+CIFAR100_DEFAULT_MEAN = (0.5071, 0.4867, 0.4408)
+CIFAR100_DEFAULT_STD = (0.2675, 0.2565, 0.2761)
 
+mean_std = {
+    "imagenet1k": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+    "cifar100": (CIFAR100_DEFAULT_MEAN, CIFAR100_DEFAULT_STD),
+}
 
 class ClassificationAugmentation:
     """Augmentation pipeline for image classification using torchvision transforms"""
