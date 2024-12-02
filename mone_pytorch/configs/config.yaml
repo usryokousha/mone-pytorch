@@ -5,7 +5,7 @@ defaults:
   - data: imagenet1k
   - augmentation: default
   - training: default
-  - logging:
+  - loggers:
     - csv_logger
     - wandb
   - scheduler: default

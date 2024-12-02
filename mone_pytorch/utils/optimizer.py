@@ -9,8 +9,14 @@ from mone_pytorch.optimizer.flora import Flora
 from typing import List, Dict, Any, Tuple
 
 
-def scale_lr(lr: float, batch_size: int, grad_accum: int, num_gpus: int) -> float:
-    return lr * batch_size * grad_accum * num_gpus / 256
+def scale_lr(
+    lr: float,
+    batch_size: int,
+    grad_accum: int,
+    num_gpus: int,
+    base_batch_size: int = 256,
+) -> float:
+    return lr * (batch_size * grad_accum * num_gpus) / base_batch_size
 
 
 def group_params(
@@ -161,7 +167,11 @@ def build_optimizer(
     training_steps = (
         cfg.training.epochs
         * cfg.data.training_size
-        // (cfg.training.batch_size * cfg.training.gradient_accumulation * fabric.world_size)
+        // (
+            cfg.training.batch_size
+            * cfg.training.gradient_accumulation
+            * fabric.world_size
+        )
     )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -169,6 +179,5 @@ def build_optimizer(
         training_steps,
     )
     fabric.print(f"Total training steps: {training_steps:,}")
-    
 
     return optimizer, scheduler

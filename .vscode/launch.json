@@ -13,6 +13,16 @@
             "env": {
                 "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}"
             }
+        },
+        {
+            "name": "Python Debugger: routing.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/mone_pytorch/layers/routing.py",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}"
+            }
         }
     ]
 }

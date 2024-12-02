@@ -10,5 +10,7 @@ num_classes: ${data.num_classes}
 
 # Additional model parameters
 num_routers: 1
-router_type: epr
-ffn_type: ffn
+use_alpha: false
+mlp_type: mlp
+block_type: sequential
+shared_router: false

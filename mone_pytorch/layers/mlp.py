@@ -16,7 +16,7 @@ class NestedMLP(nn.Module):
         in_features: int,
         mlp_ratio: int = 4,
         out_features: Optional[int] = None,
-        activation: Callable = nn.GELU,
+        activation: Callable = nn.GELU(),
         num_experts: int = 4,
         drop_rate: float = 0.0,
         bias: bool = True,
@@ -75,8 +75,8 @@ class NestedSwiGLUMLP(nn.Module):
             self.proj1.weight,
             self.proj2.weight,
             expert_mask,
-            self.proj1.bias,
-            self.proj2.bias,
+            self.proj1.bias if self.proj1.bias is not None else None,
+            self.proj2.bias if self.proj2.bias is not None else None,
             self.num_experts,
         )
         return x

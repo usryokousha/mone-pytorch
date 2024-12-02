@@ -1,5 +1,4 @@
 # Attention block using MoNE components
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +25,7 @@ class NestedSequentialBlock(nn.Module):
         mlp_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        act_layer: Callable = nn.GELU,
+        act_layer: Callable = nn.GELU(),
         capacity_dist: Optional[List[float]] = None,
         norm_layer: Callable = nn.LayerNorm,
         mlp_layer: nn.Module = NestedMLP,
@@ -43,32 +42,35 @@ class NestedSequentialBlock(nn.Module):
             num_heads,
             num_experts,
             qkv_bias,
-            proj_bias,
             qk_scale,
+            proj_bias,
             attn_drop=attn_drop,
         )
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
             dim,
             mlp_ratio,
-            num_experts,
+            num_experts=num_experts,
             activation=act_layer,
             drop_rate=proj_drop,
             bias=mlp_bias,
         )
-        self.alpha = nn.Parameter(torch.zeros((1,)))
 
     def forward(
         self,
         x: torch.Tensor,
         expert_mask: torch.Tensor,
         expert_probs: Optional[torch.Tensor] = None,
+        alpha: Optional[float] = None,
     ) -> torch.Tensor:
         # As described in the paper
         z = x + self.attention(self.norm1(x), expert_mask)
         z_prime = self.mlp(self.norm2(z), expert_mask)
 
-        output_tokens = z + (self.alpha * expert_probs + 1) * z_prime
+        if alpha is None:
+            output_tokens = z + expert_probs.unsqueeze(-1) * z_prime
+        else:
+            output_tokens = z + (alpha * expert_probs.unsqueeze(-1) + 1) * z_prime
         return output_tokens
 
 
@@ -79,12 +81,15 @@ class NestedParallelBlock(nn.Module):
         num_experts: int,
         mlp_ratio: int = 4,
         qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
         proj_bias: bool = True, # placeholder to make block compatible with other blocks
         num_heads: int = 8,
         act_layer: Callable = nn.GELU(),
         mlp_bias: bool = True, # placeholder to make block compatible with other blocks
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        mlp_layer: nn.Module = None,
+        norm_layer: nn.Module = nn.LayerNorm,
     ):
         super().__init__()
         expand_dim = 3 * dim + mlp_ratio * dim
@@ -101,11 +106,13 @@ class NestedParallelBlock(nn.Module):
             self.qkv_bias = nn.Parameter(torch.zeros((3 * dim,)))
         else:
             self.qkv_bias = None
-        self.contract_weight = nn.Parameter(torch.zeros((2 * dim, expand_dim)))
-        self.contract_bias = nn.Parameter(torch.zeros((2 * dim,)))
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.alpha = nn.Parameter(torch.zeros((1,)))
+        contract_dim = 2 * dim
+        concat_dim = mlp_ratio * dim + dim
+        self.contract_weight = nn.Parameter(torch.zeros((contract_dim, concat_dim)))
+        self.contract_bias = nn.Parameter(torch.zeros((contract_dim,)))
+        self.norm1 = norm_layer(dim)
+        self.norm2 = norm_layer(2 * dim)
+        self.scale = qk_scale or (dim // num_heads) ** -0.5
         self._init_weights()
 
     def _init_weights(self):
@@ -119,6 +126,7 @@ class NestedParallelBlock(nn.Module):
         x: torch.Tensor,
         expert_mask: torch.Tensor,
         expert_probs: Optional[torch.Tensor] = None,
+        alpha: Optional[float] = None,
     ) -> torch.Tensor:
         residual = x
         if self.qkv_bias is None:
@@ -149,8 +157,7 @@ class NestedParallelBlock(nn.Module):
             [3 * self.dim, self.mlp_ratio * self.dim],
             dim=-1,
         )
-        mlp_hidden += self.mlp_bias
-        q, kv = torch.chunk(qkv, 2, dim=-1)
+        q, kv = torch.split(qkv, [self.dim, 2 * self.dim], dim=-1)
         k, v = torch.chunk(self.norm2(kv), 2, dim=-1)
         attn_output = _attention(
             q, 
@@ -161,17 +168,19 @@ class NestedParallelBlock(nn.Module):
             self.attn_drop, 
             self.scale
         )
-        attn_output, mlp_output = torch.chunk(
-            nested_linear_contract(
-                torch.cat([attn_output, 
-                           self.act_layer(mlp_hidden)], 
+        
+        concat_output = nested_linear_contract(
+                torch.cat([F.dropout(self.act_layer(mlp_hidden), self.proj_drop, self.training),
+                          attn_output],  
                           dim=-1),
                 self.contract_weight,
-                self.contract_bias,
-            ),
-            2,
-            dim=-1,
+                expert_mask,
+            self.contract_bias,
         )
-        attn_output = attn_output + residual
-        output = attn_output + (self.alpha * expert_probs + 1) * mlp_output
+        # add residual to concat_output
+        mlp_output, attn_output = torch.chunk(concat_output + residual.repeat(1, 1, 2), 2, dim=-1)
+        if alpha is None:
+            output = attn_output + expert_probs.unsqueeze(-1) * mlp_output
+        else:
+            output = attn_output + (alpha * expert_probs.unsqueeze(-1) + 1) * mlp_output
         return output

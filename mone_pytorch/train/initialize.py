@@ -31,8 +31,11 @@ def initialize_model(cfg: DictConfig, fabric: Fabric):
         num_experts=cfg.mone.num_experts,
         qkv_bias=cfg.model.qkv_bias,
         mlp_ratio=cfg.model.mlp_ratio,
-        router_type=cfg.model.router_type,
-        ffn_type=cfg.model.ffn_type,
+        mlp_type=cfg.model.mlp_type,
+        block_type=cfg.model.block_type,
+        num_routers=cfg.model.num_routers,
+        num_classes=cfg.data.num_classes,
+        shared_router=cfg.model.shared_router
     )
 
     fabric.print(f"{cfg.model.name} model initialized")

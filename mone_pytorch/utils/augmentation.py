@@ -1,6 +1,4 @@
-from torchvision import transforms
-from torchvision.transforms import autoaugment, RandomErasing
-from torchvision.transforms.functional import InterpolationMode
+import torch
 from torchvision.transforms import v2
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
@@ -16,6 +14,7 @@ mean_std = {
     "imagenet1k": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     "cifar100": (CIFAR100_DEFAULT_MEAN, CIFAR100_DEFAULT_STD),
 }
+
 
 class ClassificationAugmentation:
     """Augmentation pipeline for image classification using torchvision transforms"""
@@ -33,8 +32,12 @@ class ClassificationAugmentation:
         self.is_train = is_train
         # Training transforms
         train_transforms = [
+            v2.ToImage(),
+            v2.ToDtype(torch.uint8, scale=True),
             v2.RandomResizedCrop(
-                img_size, scale=(0.08, 1.0), interpolation=InterpolationMode.BICUBIC
+                img_size, 
+                interpolation=v2.InterpolationMode.BICUBIC,
+                antialias=True,
             ),
             v2.RandomHorizontalFlip(),
         ]
@@ -48,7 +51,7 @@ class ClassificationAugmentation:
                             num_ops=randaugment_num_ops,
                             magnitude=randaugment_magnitude,
                             num_magnitude_bins=31,
-                            interpolation=InterpolationMode.BICUBIC,
+                            interpolation=v2.InterpolationMode.BILINEAR,
                         )
                     ],
                     p=0.5,
@@ -58,26 +61,29 @@ class ClassificationAugmentation:
         # Add normalization transforms
         train_transforms.extend(
             [
-                v2.ToTensor(),
+                v2.ToDtype(torch.float32, scale=True),
                 v2.Normalize(mean=mean, std=std),
             ]
         )
 
         # Add random erasing
         if random_erase_prob > 0:
-            train_transforms.append(RandomErasing(p=random_erase_prob))
+            train_transforms.append(v2.RandomErasing(p=random_erase_prob))
 
         self.train_transforms = v2.Compose(train_transforms)
 
         # Validation transforms
         self.val_transforms = v2.Compose(
             [
+                v2.ToImage(),
+                v2.ToDtype(torch.uint8, scale=True),
                 v2.Resize(
-                    int(img_size * 256 / 224),  # Resize to 256 if img_size is 224
-                    interpolation=InterpolationMode.BICUBIC,
+                    img_size,
+                    interpolation=v2.InterpolationMode.BICUBIC,
+                    antialias=True,
                 ),
                 v2.CenterCrop(img_size),
-                v2.ToTensor(),
+                v2.ToDtype(torch.float32, scale=True),
                 v2.Normalize(mean=mean, std=std),
             ]
         )
@@ -90,11 +96,18 @@ class ClassificationAugmentation:
 
 
 class CutMixup:
-    def __init__(self, alpha: float, num_classes: Optional[int] = None):
-        self.alpha = alpha
+    def __init__(
+        self, cutmix_alpha: float, mixup_alpha: float, num_classes: Optional[int] = None
+    ):
+        self.cutmix_alpha = cutmix_alpha
+        self.mixup_alpha = mixup_alpha
         self.num_classes = num_classes
-        self.transforms = v2.RandomChoice([v2.CutMix(alpha=alpha, num_classes=num_classes), 
-                                           v2.MixUp(alpha=alpha, num_classes=num_classes)])
+        self.transforms = v2.RandomChoice(
+            [
+                v2.CutMix(alpha=self.cutmix_alpha, num_classes=self.num_classes),
+                v2.MixUp(alpha=self.mixup_alpha, num_classes=self.num_classes),
+            ]
+        )
 
     def __call__(self, img, target):
         return self.transforms(img, target)

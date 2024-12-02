@@ -11,7 +11,7 @@ import torch.nn as nn
 from mone_pytorch.layers.patch_embed import PatchEmbed
 from mone_pytorch.layers.block import NestedSequentialBlock, NestedParallelBlock
 from mone_pytorch.layers.mlp import NestedMLP, NestedSwiGLUMLP
-from mone_pytorch.layers.routing import EPR
+from mone_pytorch.layers.routing import EPR, SEPR
 
 mlp_layer = {
     "mlp": NestedMLP,
@@ -23,17 +23,29 @@ block_layer = {
     "parallel": NestedParallelBlock,
 }
 
+router_layer = {
+    "stochastic": SEPR,
+    "deterministic": EPR,
+}
 
-def nested_vit(block_type: str = "sequential", mlp_type: str = "mlp", **kwargs):
+
+def nested_vit(
+    block_type: str = "sequential",
+    mlp_type: str = "mlp",
+    router_type: str = "stochastic",
+    **kwargs
+):
     return NestedVisionTransformer(
         block_layer=block_layer[block_type],
         mlp_layer=mlp_layer[mlp_type],
+        router_layer=router_layer[router_type],
         **kwargs
     )
 
 
 class NestedVisionTransformer(nn.Module):
     """Vision Transformer"""
+
     def __init__(
         self,
         img_size=224,
@@ -53,16 +65,19 @@ class NestedVisionTransformer(nn.Module):
         qk_scale=None,
         drop_rate=0.0,
         attn_drop_rate=0.0,
+        use_alpha=False,
         norm_layer=nn.LayerNorm,
         mlp_layer=NestedMLP,
         block_layer=NestedSequentialBlock,
         shared_router=False,
+        router_layer=EPR,
     ):
         super().__init__()
         assert (
             len(capacity_dist) == num_experts
         ), "Capacity distribution must be of length num_experts"
         self.num_features = self.embed_dim = embed_dim
+        self.num_routers = num_routers
         self.shared_router = shared_router
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -73,6 +88,9 @@ class NestedVisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.alpha = None
+        if use_alpha:
+            self.alpha = nn.Parameter(torch.zeros((1,)))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.blocks = nn.ModuleList([])
         self.routers = nn.ModuleList([])
@@ -85,7 +103,7 @@ class NestedVisionTransformer(nn.Module):
             else:
                 add_router = i == 0
             if add_router:
-                self.routers.append(EPR(embed_dim, capacity_dist, dtype=torch.float32))
+                self.routers.append(router_layer(embed_dim, capacity_dist))
             self.blocks.append(
                 block_layer(
                     dim=embed_dim,
@@ -98,10 +116,9 @@ class NestedVisionTransformer(nn.Module):
                     proj_drop=drop_rate,
                     attn_drop=attn_drop_rate,
                     num_experts=num_experts,
-                    capacity_dist=capacity_dist if add_router else None,
                     mlp_layer=mlp_layer,
                     norm_layer=norm_layer,
-                    )
+                )
             )
 
         self.norm = norm_layer(embed_dim)
@@ -124,10 +141,10 @@ class NestedVisionTransformer(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def interpolate_pos_encoding(self, x, w, h):
-        npatch = x.shape[1] - 1
-        N = self.pos_embed.shape[1] - 1
+        npatch = x.shape[1]
+        N = self.pos_embed.shape[1]
         if npatch == N and w == h:
-            return self.pos_embed
+            return self.pos_embed.to(x.dtype)
         patch_pos_embed = self.pos_embed
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
@@ -162,14 +179,23 @@ class NestedVisionTransformer(nn.Module):
         x = self.prepare_tokens(x)
         expert_mask = None
         router_probs = None
+        total_capacity_loss = torch.tensor(0.0, device=x.device)
         for i, blk in enumerate(self.blocks):
             if i % self.blocks_per_router == 0:
                 if not self.shared_router:
                     idx_router = i // self.blocks_per_router
                 else:
                     idx_router = 0
-                expert_mask, router_probs = self.routers[idx_router](x, jitter_noise)
-            x = blk(x, expert_mask, router_probs)
+                expert_mask, router_probs, capacity_loss = self.routers[idx_router](
+                    x, jitter_noise
+                )
+            if capacity_loss is not None:
+                total_capacity_loss += capacity_loss
+            x = blk(x, expert_mask, router_probs, self.alpha)
         x = self.norm(x)
         # global average pooling
-        return self.head(x.mean(dim=1))
+        output = self.head(x.mean(dim=1))
+        if isinstance(self.routers[0], SEPR):
+            return output, total_capacity_loss / self.num_routers
+        else:
+            return output, None

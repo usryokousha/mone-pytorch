@@ -13,6 +13,11 @@ log_interval: 50
 val_interval: 1
 save_interval: 10
 
+logging:
+  flops: false
+  interval: 10
+resume_from_checkpoint: null
+
 checkpoints:
   path: "path/to/checkpoints"
   resume_from_checkpoint: null # Will be auto-generated if not specified 

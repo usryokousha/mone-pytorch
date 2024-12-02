@@ -1,2 +1,5 @@
 *.pyc
+# ignore anything in outputs folder
 outputs/*
+experiments/*
+.vscode/launch.json

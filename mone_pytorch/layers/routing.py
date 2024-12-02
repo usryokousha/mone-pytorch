@@ -11,7 +11,9 @@ from typing import List, Tuple
 """Implementation of the routing algorithm for the MONE model."""
 
 
-def get_expert_probs(router_probs: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+def get_expert_probs(
+    router_probs: torch.Tensor, token_mask: torch.Tensor
+) -> torch.Tensor:
     """Get probabilities for assigned experts based on logits and token mask"""
     expert_probs = router_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
     return expert_probs
@@ -39,19 +41,16 @@ class EPR(nn.Module):
     def __init__(
         self,
         dim: int,
-        capacity_distribution: List[float],
-        dtype: torch.dtype = torch.float32,
+        capacity_distribution: List[float]
     ):
         super().__init__()
         self.dim = dim
-
         assert (
             sum(capacity_distribution) == 1.0
         ), "The sum of the capacity distribution must be 1.0"
         self.capacity_distribution = capacity_distribution
-        self.dtype = dtype
         self.num_experts = len(capacity_distribution)
-        self.router = nn.Linear(dim, self.num_experts, dtype=dtype)
+        self.router = nn.Linear(dim, self.num_experts)
         self._init_weights()
 
     def _init_weights(self):
@@ -59,16 +58,17 @@ class EPR(nn.Module):
         nn.init.uniform_(self.router.weight, a=-2e-2, b=2e-2)
         nn.init.zeros_(self.router.bias)
 
+    @torch.amp.autocast(enabled=False, device_type="cuda")
     def _compute_router_probs(
         self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the router probabilities for the input tokens.
+        Keeps computation in float32 for numerical stability.
         """
         logits = self.router(input_tokens)
         if jitter_noise > 0.0:
-            # add jitter noise to the logits
-            noise = torch.randn_like(logits, dtype=self.dtype) * jitter_noise
+            noise = torch.randn_like(logits, dtype=logits.dtype, device=logits.device) * jitter_noise
             logits = logits + noise
 
         probs = F.softmax(logits, dim=-1)
@@ -94,9 +94,6 @@ class EPR(nn.Module):
         token_mask = torch.full(
             (batch_size, num_tokens), -1, dtype=torch.long, device=device
         )
-        unassigned_mask = torch.ones(
-            (batch_size, num_tokens), dtype=torch.bool, device=device
-        )
 
         # For each expert, assign tokens
         for j in reversed(range(self.num_experts)):
@@ -109,7 +106,7 @@ class EPR(nn.Module):
             r_j = router_probs[:, :, j]  # [batch_size, num_tokens]
 
             # Mask already assigned tokens
-            r_j = r_j.masked_fill(~unassigned_mask, float("-inf"))
+            r_j = r_j.masked_fill(token_mask != -1, float("-inf"))
 
             # Get the top-k tokens for this expert
             _, topk_indices = torch.topk(r_j, capacity, dim=1)
@@ -117,32 +114,163 @@ class EPR(nn.Module):
             # Assign tokens to the expert
             token_mask[:, topk_indices] = j
 
-            # Update unassigned mask
-            unassigned_mask[:, topk_indices] = False
-
         # Assign any remaining unassigned tokens to expert 0
         token_mask[token_mask == -1] = 0
 
         return token_mask
 
     def forward(
-        self, input_tokens: torch.Tensor, prev_logits: torch.Tensor = None, jitter_noise: float = 0.0
+        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_tokens, dim = input_tokens.shape
-        device = input_tokens.device
-        dtype = input_tokens.dtype
-
-        # Get router probabilities
+        # Store original dtype
+        orig_dtype = input_tokens.dtype
+        
+        # Router probabilities computed in float32
         router_probs = self._compute_router_probs(
-            input_tokens.to(self.dtype), prev_logits, jitter_noise
+            input_tokens.to(torch.float32), jitter_noise
         )
 
-        # Assign tokens to experts
-        token_mask = self._assign_tokens_to_experts(router_probs, num_tokens, device)
+        # Convert back to original dtype for subsequent calculations
+        router_probs = router_probs.to(dtype=orig_dtype)
 
+        # Token assignment in original dtype
+        token_mask = self._assign_tokens_to_experts(
+            router_probs, input_tokens.shape[1], input_tokens.device
+        )
         expert_probs = get_expert_probs(router_probs, token_mask)
+        
+        return token_mask, expert_probs
 
-        return token_mask, expert_probs.to(dtype)
+class TempDecayScheduler:
+    """Temperature scheduler for Gumbel-Softmax with exponential decay."""
+    
+    def __init__(
+        self,
+        initial_tau: float = 1.0,
+        final_tau: float = 0.5,
+        decay_rate: float = 0.01,
+        decay_steps: int = 1000,
+    ):
+        self.initial_tau = initial_tau
+        self.final_tau = final_tau
+        self.decay_rate = decay_rate
+        self.decay_steps = decay_steps
+        self.current_step = 0
+        self.tau = initial_tau
+
+    def step(self) -> float:
+        """Update and return the current temperature."""
+        self.current_step += 1
+        decay_factor = self.decay_rate ** max(self.current_step / self.decay_steps, 1)
+        self.tau = max(self.final_tau, self.initial_tau * decay_factor)
+        return self.tau
+
+class SEPR(EPR):
+    """
+    Stochastic Expert Preferred Router (SEPR)
+
+    This router extends the Expert Preferred Router (EPR) by incorporating the
+    Gumbel-Softmax trick with a straight-through estimator to enable differentiable
+    token-to-expert assignments. 
+
+    Args:
+        dim (int): The dimension of the input tokens.
+        capacity_distribution (List[float]): A list of floats representing the capacity
+                                             distribution across experts. Must sum to 1.0.
+        dtype (torch.dtype, optional): The data type for the module. Defaults to torch.float32.
+
+    Attributes:
+        dim (int): The dimension of the input tokens.
+        capacity_distribution (torch.Tensor): The capacity distribution across experts.
+        dtype (torch.dtype): The data type for the module.
+        tau (float): Current temperature for Gumbel-Softmax.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        capacity_distribution: List[float],
+    ):
+        super().__init__(dim, capacity_distribution)
+        self.capacity_distribution = torch.tensor(capacity_distribution)
+
+    def _compute_router_probs(
+        self, input_tokens: torch.Tensor, tau: float = 1.0, hard: bool = True
+    ) -> torch.Tensor:
+        """
+        Compute the router probabilities for the input tokens using Gumbel-Softmax.
+
+        Args:
+            input_tokens (torch.Tensor): The input tokens of shape [batch_size, seq_length, dim].
+            tau (float): Temperature parameter for Gumbel-Softmax.
+            hard (bool): Whether to return hard one-hot vectors.
+
+        Returns:
+            torch.Tensor: Router probabilities of shape [batch_size, seq_length, num_experts].
+        """
+        logits = self.router(input_tokens)
+
+        if self.training:
+            # Training mode: use Gumbel-Softmax with provided temperature
+            probs = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
+        else:
+            # Inference mode: use deterministic assignments
+            probs = torch.zeros_like(logits)
+            indices = torch.argmax(logits, dim=-1, keepdim=True)
+            probs.scatter_(-1, indices, 1.0)
+
+        return probs
+
+    def forward(
+        self, input_tokens: torch.Tensor, tau: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the Stochastic Expert Preferred Router (SEPR).
+
+        Args:
+            input_tokens (torch.Tensor): Input tokens of shape [batch_size, seq_length, dim].
+            tau (float): Temperature parameter for Gumbel-Softmax.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - token_mask: Tensor of shape [batch_size, seq_length] with expert assignments.
+                - expert_probs: Tensor of shape [batch_size, seq_length] with expert probabilities.
+                - capacity_loss: Scalar tensor representing the capacity loss (only during training).
+        """
+        # Store original dtype
+        orig_dtype = input_tokens.dtype
+
+        # Compute router probabilities with provided temperature
+        router_probs = self._compute_router_probs(
+            input_tokens.to(torch.float32), tau=tau, hard=True
+        )
+
+        # Convert back to original dtype for subsequent calculations
+        router_probs = router_probs.to(dtype=orig_dtype)
+
+        # Token assignments (indices of the experts)
+        token_mask = torch.argmax(router_probs, dim=-1)
+
+        # Expert probabilities (soft probabilities used for gradient flow)
+        logits = self.router(input_tokens)
+        soft_probs = F.softmax(logits, dim=-1)
+        expert_probs = soft_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
+
+        # Compute capacity loss only during training
+        if self.training:
+            batch_size, seq_length, _ = router_probs.shape
+            expert_token_counts = router_probs.sum(dim=(0, 1))  # Shape: [num_experts]
+            empirical_capacity = expert_token_counts / (batch_size * seq_length)
+            capacity_loss = F.mse_loss(
+                empirical_capacity,
+                self.capacity_distribution.to(empirical_capacity.device),
+            )
+        else:
+            capacity_loss = torch.tensor(0.0, device=input_tokens.device)
+
+        return token_mask, expert_probs, capacity_loss
+
+
 
 
 class NestedCombine(nn.Module):
@@ -241,39 +369,7 @@ def compute_capacity_distribution(e_c, E, delta=2, beta=10):
 
 
 if __name__ == "__main__":
-    import time
-
-    def benchmark(router, input_tokens):
-        start_time = time.time()
-        token_mask, assigned_probs = router(input_tokens)
-        torch.cuda.synchronize()  # Ensure all CUDA operations are finished
-        end_time = time.time()
-        return end_time - start_time
-
-    # Define input tokens
-    batch_size = 32
-    num_tokens = 100
-    dim = 128
-    input_tokens = torch.randn(batch_size, num_tokens, dim).cuda()
-
-    # Define capacity distribution
-    capacity_distribution = [0.2, 0.3, 0.5]  # Sum must be 1.0
-
-    # Initialize router
-    router = ExpertPreferredRouter(
-        dim=dim, capacity_distribution=capacity_distribution
-    ).cuda()
-
-    # Forward pass
-    token_mask, router_probs = router(input_tokens)
-
-    print("Token Mask:", token_mask.cpu())
-    print("Router Probabilities:", router_probs.cpu())
-
-    # benchmark
-    print(f"Execution time: {benchmark(router, input_tokens):.6f} seconds")
-
-    # Parameters
+        # Parameters
     e_c = 0.6  # Effective capacity (between 0 and 1)
     E = 3  # Number of experts
     delta = 2  # Incentive parameter (>1)
@@ -293,3 +389,45 @@ if __name__ == "__main__":
         capacity_distribution * np.array([2 ** (E - i - 1) for i in range(E)])
     ) / (2 ** (E - 1))
     print(f"Effective Capacity e_c: {effective_capacity:.4f} (should be {e_c})")
+
+    import time
+
+    def benchmark(router, input_tokens):
+        start_time = time.time()
+        token_mask, assigned_probs = router(input_tokens)
+        torch.cuda.synchronize()  # Ensure all CUDA operations are finished
+        end_time = time.time()
+        return end_time - start_time
+
+    # Define input tokens
+    batch_size = 32
+    num_tokens = 100
+    dim = 128
+    input_tokens = torch.randn(batch_size, num_tokens, dim).cuda()
+
+    # Capacity distribution from above
+
+    # Initialize router
+    router = EPR(
+        dim=dim, capacity_distribution=capacity_distribution
+    ).cuda()
+
+    # Forward pass
+    token_mask, router_probs = router(input_tokens)
+
+    print("Token Mask:", token_mask.cpu())
+    print("Router Probabilities:", router_probs.cpu())
+
+    # benchmark
+    print(f"Execution time: {benchmark(router, input_tokens):.6f} seconds")
+
+    router = SEPR(
+        dim=dim, capacity_distribution=capacity_distribution
+    ).cuda()
+
+    token_mask, router_probs, capacity_loss = router(input_tokens)
+
+    print("Token Mask:", token_mask.cpu())
+    print("Router Probabilities:", router_probs.cpu())
+    print("Capacity Loss:", capacity_loss)
+
