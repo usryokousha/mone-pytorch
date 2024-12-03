@@ -1,8 +1,5 @@
 import torch
 from torchvision.transforms import v2
-from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
-
 from typing import Optional
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
@@ -111,43 +108,3 @@ class CutMixup:
 
     def __call__(self, img, target):
         return self.transforms(img, target)
-
-
-def build_dataloaders(cfg):
-    """Build training and validation dataloaders with augmentations"""
-
-    train_augmentation = ClassificationAugmentation(
-        img_size=cfg.model.img_size,
-        randaugment_num_ops=cfg.augmentation.randaugment.num_ops,
-        randaugment_magnitude=cfg.augmentation.randaugment.magnitude,
-        random_erase_prob=cfg.augmentation.random_erase.probability,
-        is_train=True,
-    )
-
-    val_augmentation = ClassificationAugmentation(
-        img_size=cfg.model.img_size, is_train=False
-    )
-
-    # Create datasets
-    train_dataset = ImageFolder(root=cfg.paths.train_dir, transform=train_augmentation)
-    val_dataset = ImageFolder(root=cfg.paths.val_dir, transform=val_augmentation)
-
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.train.batch_size,
-        shuffle=True,
-        num_workers=cfg.train.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.train.batch_size,
-        shuffle=False,
-        num_workers=cfg.train.num_workers,
-        pin_memory=True,
-    )
-
-    return train_loader, val_loader

@@ -2,6 +2,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder, ImageNet, CIFAR100
 
 from mone_pytorch.utils import augmentation
+
 def build_dataloaders(cfg):
     # Create augmentation instance
     train_augmentation = augmentation.ClassificationAugmentation(

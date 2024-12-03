@@ -10,6 +10,7 @@ log_interval: 50
 val_interval: 1
 save_interval: 10 # Save checkpoint every 10 epochs
 jitter_noise: 0.0
+capacity_loss_weight: 10.0
 ema:
   enabled: false
   decay: 0.9999

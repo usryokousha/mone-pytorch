@@ -6,6 +6,63 @@ from .nested_linear import nested_mlp, nested_swiglu_mlp
 from typing import Optional, Callable
 
 
+class MLP(nn.Module):
+    """
+    MLP layer.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_ratio: int = 4,
+        out_features: Optional[int] = None,
+        activation: Callable = nn.GELU(),
+        drop_rate: float = 0.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.mlp_ratio = mlp_ratio
+        self.activation = activation
+        if out_features is None:
+            out_features = in_features
+        self.proj1 = nn.Linear(in_features, in_features * mlp_ratio, bias=bias)
+        self.proj2 = nn.Linear(in_features * mlp_ratio, out_features, bias=bias)
+        self.drop_rate = drop_rate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj1(x)
+        x = self.activation(x)
+        x = F.dropout(x, p=self.drop_rate, training=self.training)
+        x = self.proj2(x)
+        return x
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU activation function.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_ratio: int = 2,
+        out_features: Optional[int] = None,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.mlp_ratio = mlp_ratio
+        if out_features is None:
+            out_features = in_features
+        self.proj1 = nn.Linear(in_features, in_features * mlp_ratio, bias=bias)
+        self.proj2 = nn.Linear(in_features * mlp_ratio, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        x = x1 * F.silu(x2)
+        x = self.proj2(x)
+        return x
+
+
 class NestedMLP(nn.Module):
     """
     Nested MLP layer with token-wise expert assignment.

@@ -120,7 +120,7 @@ class EPR(nn.Module):
         return token_mask
 
     def forward(
-        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
+        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0, tau: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Store original dtype
         orig_dtype = input_tokens.dtype
@@ -141,7 +141,7 @@ class EPR(nn.Module):
         
         return token_mask, expert_probs
 
-class TempDecayScheduler:
+class TauDecayScheduler:
     """Temperature scheduler for Gumbel-Softmax with exponential decay."""
     
     def __init__(
@@ -150,12 +150,13 @@ class TempDecayScheduler:
         final_tau: float = 0.5,
         decay_rate: float = 0.01,
         decay_steps: int = 1000,
+        initial_step: int = 0,
     ):
         self.initial_tau = initial_tau
         self.final_tau = final_tau
         self.decay_rate = decay_rate
         self.decay_steps = decay_steps
-        self.current_step = 0
+        self.current_step = initial_step
         self.tau = initial_tau
 
     def step(self) -> float:
@@ -222,13 +223,14 @@ class SEPR(EPR):
         return probs
 
     def forward(
-        self, input_tokens: torch.Tensor, tau: float = 1.0
+        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0, tau: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the Stochastic Expert Preferred Router (SEPR).
 
         Args:
             input_tokens (torch.Tensor): Input tokens of shape [batch_size, seq_length, dim].
+            jitter_noise (float): Jitter noise parameter for Gumbel-Softmax.
             tau (float): Temperature parameter for Gumbel-Softmax.
 
         Returns:

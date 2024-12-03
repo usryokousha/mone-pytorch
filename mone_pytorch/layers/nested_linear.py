@@ -55,11 +55,10 @@ def nested_linear_expand(
     input_shape = x.shape
     batch_seq = x.shape[:-1].numel()
 
-    # with torch.amp.autocast(device_type="cuda", dtype=torch.get_autocast_gpu_dtype()):
-    #     output = torch.zeros(
-    #         (batch_seq, out_dim), device=x.device, dtype=torch.get_autocast_gpu_dtype()
-    #     )
-    output = torch.zeros((batch_seq, out_dim), device=x.device, dtype=x.dtype)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.get_autocast_gpu_dtype()):
+        output = torch.zeros(
+            (batch_seq, out_dim), device=x.device, dtype=torch.get_autocast_gpu_dtype()
+        )
     x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         # get the valid mask for the m-th expert

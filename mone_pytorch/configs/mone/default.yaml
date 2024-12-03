@@ -2,4 +2,8 @@ effective_capacity: 0.6
 num_experts: 4
 delta: 2
 beta: 10
-jitter_noise: 0.0 
+jitter_noise: 0.0
+initial_tau: 1.0
+final_tau: 0.5
+decay_rate: 0.01
+decay_steps: 1000

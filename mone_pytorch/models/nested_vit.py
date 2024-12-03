@@ -175,11 +175,11 @@ class NestedVisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward(self, x, jitter_noise=0.0):
+    def forward(self, x, jitter_noise=0.0, tau=1.0):
         x = self.prepare_tokens(x)
         expert_mask = None
         router_probs = None
-        total_capacity_loss = torch.tensor(0.0, device=x.device)
+        total_capacity_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         for i, blk in enumerate(self.blocks):
             if i % self.blocks_per_router == 0:
                 if not self.shared_router:
@@ -187,7 +187,7 @@ class NestedVisionTransformer(nn.Module):
                 else:
                     idx_router = 0
                 expert_mask, router_probs, capacity_loss = self.routers[idx_router](
-                    x, jitter_noise
+                    x, jitter_noise, tau
                 )
             if capacity_loss is not None:
                 total_capacity_loss += capacity_loss
