@@ -1,17 +1,11 @@
-name: nested-vit-base
+name: vit-base
 embed_dim: 768
 depth: 12
 num_heads: 12
 mlp_ratio: 4
-qkv_bias: true
+qkv_bias: false
 patch_size: 16
 img_size: 224
 num_classes: ${data.num_classes}
-
-# Additional model parameters
-num_routers: 1
-use_alpha: false
 mlp_type: mlp
-block_type: sequential
-router_type: deterministic
-shared_router: false
+block_type: parallel

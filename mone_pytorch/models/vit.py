@@ -9,30 +9,33 @@ import torch
 import torch.nn as nn
 
 from mone_pytorch.layers.patch_embed import PatchEmbed
-from mone_pytorch.layers.block import NestedSequentialBlock, NestedParallelBlock
-from mone_pytorch.layers.mlp import NestedMLP, NestedSwiGLUMLP
-from mone_pytorch.layers.routing import EPR
-
-from typing import Tuple
+from mone_pytorch.layers.block import SequentialBlock, ParallelBlock
+from mone_pytorch.layers.mlp import MLP, SwiGLUMLP
 
 mlp_layer = {
-    "mlp": NestedMLP,
-    "swiglu": NestedSwiGLUMLP,
+    "mlp": MLP,
+    "swiglu": SwiGLUMLP,
 }
 
 block_layer = {
-    "sequential": NestedSequentialBlock,
-    "parallel": NestedParallelBlock,
+    "sequential": SequentialBlock,
+    "parallel": ParallelBlock,
 }
 
 
-def nested_vit(block_type: str = "sequential", mlp_type: str = "mlp", **kwargs):
-    return NestedVisionTransformer(
-        block_layer=block_layer[block_type], mlp_layer=mlp_layer[mlp_type], **kwargs
+def vit(
+    block_type: str = "sequential",
+    mlp_type: str = "mlp",
+    **kwargs
+):
+    return VisionTransformer(
+        block_layer=block_layer[block_type],
+        mlp_layer=mlp_layer[mlp_type],
+        **kwargs
     )
 
 
-class NestedVisionTransformer(nn.Module):
+class VisionTransformer(nn.Module):
     """Vision Transformer"""
 
     def __init__(
@@ -43,9 +46,6 @@ class NestedVisionTransformer(nn.Module):
         num_classes=0,
         embed_dim=768,
         depth=12,
-        num_experts=4,
-        capacity_dist=[1.0, 0.0, 0.0, 0.0],
-        num_routers=1,
         num_heads=12,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -54,20 +54,12 @@ class NestedVisionTransformer(nn.Module):
         qk_scale=None,
         drop_rate=0.0,
         attn_drop_rate=0.0,
-        use_alpha=False,
-        norm_layer=nn.LayerNorm,
-        mlp_layer=NestedMLP,
-        block_layer=NestedSequentialBlock,
-        shared_router=False,
-        router_layer=EPR,
+        norm_layer=nn.RMSNorm,
+        mlp_layer=MLP,
+        block_layer=SequentialBlock,
     ):
         super().__init__()
-        assert (
-            len(capacity_dist) == num_experts
-        ), "Capacity distribution must be of length num_experts"
         self.num_features = self.embed_dim = embed_dim
-        self.num_routers = num_routers
-        self.shared_router = shared_router
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
@@ -76,23 +68,13 @@ class NestedVisionTransformer(nn.Module):
         )
         num_patches = self.patch_embed.num_patches
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
-        self.alpha = None
-        if use_alpha:
-            self.alpha = nn.Parameter(torch.zeros((1,)))
+        # Add cls token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Position embedding for patches + cls token
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.blocks = nn.ModuleList([])
-        self.routers = nn.ModuleList([])
-        # possible improvement on original implementation
-        # router weights are shared across blocks
-        self.blocks_per_router = depth // num_routers
-        for i in range(depth):
-            if not self.shared_router:
-                add_router = i % self.blocks_per_router == 0
-            else:
-                add_router = i == 0
-            if add_router:
-                self.routers.append(router_layer(embed_dim, capacity_dist))
+        for _ in range(depth):
             self.blocks.append(
                 block_layer(
                     dim=embed_dim,
@@ -104,7 +86,6 @@ class NestedVisionTransformer(nn.Module):
                     qk_scale=qk_scale,
                     proj_drop=drop_rate,
                     attn_drop=attn_drop_rate,
-                    num_experts=num_experts,
                     mlp_layer=mlp_layer,
                     norm_layer=norm_layer,
                 )
@@ -117,7 +98,9 @@ class NestedVisionTransformer(nn.Module):
             nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
         )
 
+        # Initialize weights
         torch.nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        torch.nn.init.trunc_normal_(self.cls_token, std=0.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -130,11 +113,15 @@ class NestedVisionTransformer(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def interpolate_pos_encoding(self, x, w, h):
-        npatch = x.shape[1]
-        N = self.pos_embed.shape[1]
+        npatch = x.shape[1] - 1  # Remove cls token
+        N = self.pos_embed.shape[1] - 1  # Remove cls token position
         if npatch == N and w == h:
             return self.pos_embed.to(x.dtype)
-        patch_pos_embed = self.pos_embed
+        
+        # Only interpolate patch position embeddings, handle cls token separately
+        cls_pos_embed = self.pos_embed[:, 0:1]
+        patch_pos_embed = self.pos_embed[:, 1:]
+        
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size
@@ -153,36 +140,26 @@ class NestedVisionTransformer(nn.Module):
             and int(h0) == patch_pos_embed.shape[-1]
         )
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return patch_pos_embed
+        return torch.cat((cls_pos_embed, patch_pos_embed), dim=1)
 
     def prepare_tokens(self, x):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)  # patch linear embedding
+
+        # Add cls token
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
 
         # add positional encoding to each token
         x = x + self.interpolate_pos_encoding(x, w, h)
 
         return self.pos_drop(x)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        capacity_dist: Tuple[float] = None,
-        jitter_noise: float = 0.0,
-    ) -> torch.Tensor:
+    def forward(self, x):
         x = self.prepare_tokens(x)
-        expert_mask = None
-        router_probs = None
-        for i, blk in enumerate(self.blocks):
-            if i % self.blocks_per_router == 0:
-                if not self.shared_router:
-                    idx_router = i // self.blocks_per_router
-                else:
-                    idx_router = 0
-                expert_mask, router_probs = self.routers[idx_router](
-                    x, capacity_dist=capacity_dist, jitter_noise=jitter_noise
-                )
-            x = blk(x, expert_mask, router_probs, self.alpha)
+        for blk in self.blocks:
+            x = blk(x)
         x = self.norm(x)
-        # global average pooling
-        return self.head(x.mean(dim=1))
+        # Use cls token for classification
+        output = self.head(x[:, 0])
+        return output

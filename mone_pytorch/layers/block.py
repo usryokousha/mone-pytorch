@@ -38,11 +38,11 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
-class Block(nn.Module):
+class SequentialBlock(nn.Module):
     def __init__(
         self,
         dim: int,
-        num_experts: int,
+        num_heads: int,
         mlp_ratio: int = 4,
         qkv_bias: bool = False,
         qk_scale: Optional[float] = None,
@@ -57,7 +57,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.num_experts = num_experts
+        self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.qkv_bias = qkv_bias
         self.qk_scale = qk_scale
@@ -70,11 +70,21 @@ class Block(nn.Module):
         self.mlp_layer = mlp_layer
         self.norm1 = norm_layer(dim)
         self.attention = Attention(
-            dim, num_experts, qkv_bias, qk_scale, proj_bias, attn_drop, proj_drop
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            proj_bias=proj_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
         )
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
-            dim, mlp_ratio, num_experts, act_layer, proj_drop, mlp_bias
+            in_features=dim,
+            mlp_ratio=mlp_ratio,
+            activation=act_layer,
+            drop_rate=drop_prob,
+            bias=mlp_bias,
         )
         self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
 
@@ -149,19 +159,22 @@ class ParallelBlock(nn.Module):
     def __init__(
         self,
         dim: int,
+        num_heads: int = 8,
         mlp_ratio: int = 4,
         qkv_bias: bool = False,
         qk_scale: Optional[float] = None,
         proj_bias: bool = True,
         drop_prob: float = 0.0,
         act_layer: Callable = nn.GELU(),
-        mlp_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         norm_layer: Callable = nn.RMSNorm,
-        num_heads: int = 8,
+        **kwargs
     ):
         super().__init__()
+        expand_dim = 3 * dim + mlp_ratio * dim
+        contract_dim = 2 * dim
+        concat_dim = mlp_ratio * dim + dim
         self.dim = dim
         self.mlp_ratio = mlp_ratio
         self.qkv_bias = qkv_bias
@@ -169,18 +182,16 @@ class ParallelBlock(nn.Module):
         self.proj_bias = proj_bias
         self.drop_prob = drop_prob
         self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(2 * dim)
         self.num_heads = num_heads
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
         self.scale = qk_scale or (dim // num_heads) ** -0.5
         self.act_layer = act_layer
-        self.expand_weight = nn.Parameter(torch.zeros((3 * dim, dim)))
-        self.contract_weight = nn.Parameter(
-            torch.zeros((2 * dim, mlp_ratio * dim + dim))
-        )
+        self.expand_weight = nn.Parameter(torch.zeros((expand_dim, dim)))
+        self.contract_weight = nn.Parameter(torch.zeros((contract_dim, concat_dim)))
         self.mlp_bias = nn.Parameter(torch.zeros((mlp_ratio * dim,)))
-        self.contract_bias = nn.Parameter(torch.zeros((2 * dim,)))
+        self.contract_bias = nn.Parameter(torch.zeros((contract_dim,)))
         if qkv_bias:
             self.qkv_bias = nn.Parameter(torch.zeros((3 * dim,)))
         else:
@@ -222,17 +233,17 @@ class ParallelBlock(nn.Module):
         attn_output = _attention(
             q, k, v, self.num_heads, self.dim, self.attn_drop, self.scale
         )
-        mlp_output, attn_output = torch.split(
+        mlp_output, attn_output = torch.chunk(
             F.linear(
                 torch.cat([mlp_hidden, attn_output], dim=-1),
                 self.contract_weight,
                 bias=self.contract_bias,
             ),
-            [self.mlp_ratio * self.dim, self.dim],
+            2,
             dim=-1,
         )
         attn_output = F.dropout(attn_output, self.proj_drop, self.training)
-        output = self.drop_path(attn_output) + self.drop_path(mlp_output)
+        output = self.drop_path(attn_output + mlp_output)
         output = output + residual
         return output
 
@@ -247,14 +258,12 @@ class NestedParallelBlock(nn.Module):
         mlp_ratio: int = 4,
         qkv_bias: bool = False,
         qk_scale: Optional[float] = None,
-        proj_bias: bool = True,  # placeholder to make block compatible with other blocks
         num_heads: int = 8,
         act_layer: Callable = nn.GELU(),
-        mlp_bias: bool = True,  # placeholder to make block compatible with other blocks
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        mlp_layer: nn.Module = None,
         norm_layer: nn.Module = nn.LayerNorm,
+        **kwargs
     ):
         super().__init__()
         expand_dim = 3 * dim + mlp_ratio * dim

@@ -14,6 +14,7 @@ class NestedLinearExpand(nn.Linear):
         num_experts=4,
         device=None,
         dtype=None,
+        sparse: bool = False,
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.num_experts = num_experts
@@ -289,6 +290,24 @@ def nested_mlp(
             output[valid_mask, :D_m_out] = F.dropout(y_m, drop_rate, training)
 
     return output.reshape(input_shape[:-1] + (out_dim,))
+
+def nested_mlp_sparse(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    expert_mask: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
+    activation: Callable = F.gelu,
+    drop_rate: float = 0.0,
+    num_experts: int = 4,
+    training: bool = True,
+) -> torch.Tensor:
+    output = nested_linear_expand_sparse(x, w1, expert_mask, b1, num_experts)
+    output = activation(output)
+    output = F.dropout(output, drop_rate, training)
+    output = nested_linear_contract(output, w2, expert_mask, b2, num_experts)
+    return output
 
 
 def nested_swiglu_mlp(

@@ -10,7 +10,6 @@ from mone_pytorch.data.dataloader import build_dataloaders
 from mone_pytorch.train.initialize import initialize_model
 from mone_pytorch.utils.optimizer import build_optimizer, scale_lr
 from mone_pytorch.utils.augmentation import CutMixup
-from mone_pytorch.layers.routing import TauDecayScheduler
 
 def train_one_epoch(
     fabric: Fabric,
@@ -29,34 +28,19 @@ def train_one_epoch(
         mixup_alpha=cfg.augmentation.mixup.alpha,
         num_classes=cfg.model.num_classes,
     )
-    if cfg.model.router_type == "sepr":
-        tau_scheduler = TauDecayScheduler(
-            initial_tau=cfg.mone.initial_tau,
-            final_tau=cfg.mone.final_tau,
-            decay_rate=cfg.mone.decay_rate,
-            decay_steps=cfg.mone.decay_steps,
-            initial_step=epoch * len(train_loader),
-        )
 
     for batch_idx, (images, targets) in enumerate(train_loader):
         with fabric.no_backward_sync(
             model,
             enabled=(batch_idx + 1) % cfg.training.gradient_accumulation != 0,
-        ):  
-            # temperature for SEPR
-            tau = 1.0
-            if cfg.model.router_type == "sepr" and (batch_idx + 1) % cfg.training.gradient_accumulation == 0:
-                tau = tau_scheduler.step()
-
+        ):
             # Apply mixup/cutmix transforms
             images, targets = cutmixup(images, targets)
-            outputs, capacity_loss = model(images, cfg.training.jitter_noise, tau)
+            outputs = model(images)
 
             loss = torch.nn.functional.cross_entropy(
                 outputs, targets, label_smoothing=cfg.augmentation.label_smoothing
             )
-            if capacity_loss is not None:
-                loss += cfg.training.capacity_loss_weight * capacity_loss
 
             fabric.backward(loss)
 
@@ -96,9 +80,7 @@ def train_one_epoch(
                 metrics_dict = metrics.compute()
                 metrics_dict["train/learning_rate"] = scheduler.get_last_lr()[0]
                 metrics_dict["train/loss"] = loss.detach()
-                if capacity_loss is not None:
-                    metrics_dict["train/temperature"] = tau
-                    metrics_dict["train/capacity_loss"] = capacity_loss.detach()
+
 
                 fabric.log_dict(metrics_dict, step=global_step)
 
@@ -131,9 +113,9 @@ def validate(
     if fabric.is_global_zero:
         fabric.print(
             f"Validation Results - Epoch: {epoch}\n"
-            f"Top-1 Accuracy: {metrics_dict['acc/top1']:.2f}%\n"
-            f"Top-5 Accuracy: {metrics_dict['acc/top5']:.2f}%\n"
-            f"Precision: {metrics_dict['prec/top1']:.2f}%\n"
+            f"Top-1 Accuracy: {metrics_dict['val/acc/top1']:.2f}%\n"
+            f"Top-5 Accuracy: {metrics_dict['val/acc/top5']:.2f}%\n"
+            f"Precision: {metrics_dict['val/prec/top1']:.2f}%\n"
             f"Loss: {metrics_dict['val/loss']:.4f}"
         )
 

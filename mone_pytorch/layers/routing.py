@@ -41,7 +41,7 @@ class EPR(nn.Module):
     def __init__(
         self,
         dim: int,
-        capacity_distribution: List[float]
+        capacity_distribution: Tuple[float]
     ):
         super().__init__()
         self.dim = dim
@@ -120,10 +120,14 @@ class EPR(nn.Module):
         return token_mask
 
     def forward(
-        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0, tau: float = 1.0
+        self, input_tokens: torch.Tensor, capacity_dist: Tuple[float], jitter_noise: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Store original dtype
         orig_dtype = input_tokens.dtype
+
+        # Update capacity distribution if provided
+        if capacity_dist is not None:
+            self.capacity_distribution = capacity_dist
         
         # Router probabilities computed in float32
         router_probs = self._compute_router_probs(
@@ -140,140 +144,6 @@ class EPR(nn.Module):
         expert_probs = get_expert_probs(router_probs, token_mask)
         
         return token_mask, expert_probs
-
-class TauDecayScheduler:
-    """Temperature scheduler for Gumbel-Softmax with exponential decay."""
-    
-    def __init__(
-        self,
-        initial_tau: float = 1.0,
-        final_tau: float = 0.5,
-        decay_rate: float = 0.01,
-        decay_steps: int = 1000,
-        initial_step: int = 0,
-    ):
-        self.initial_tau = initial_tau
-        self.final_tau = final_tau
-        self.decay_rate = decay_rate
-        self.decay_steps = decay_steps
-        self.current_step = initial_step
-        self.tau = initial_tau
-
-    def step(self) -> float:
-        """Update and return the current temperature."""
-        self.current_step += 1
-        decay_factor = self.decay_rate ** max(self.current_step / self.decay_steps, 1)
-        self.tau = max(self.final_tau, self.initial_tau * decay_factor)
-        return self.tau
-
-class SEPR(EPR):
-    """
-    Stochastic Expert Preferred Router (SEPR)
-
-    This router extends the Expert Preferred Router (EPR) by incorporating the
-    Gumbel-Softmax trick with a straight-through estimator to enable differentiable
-    token-to-expert assignments. 
-
-    Args:
-        dim (int): The dimension of the input tokens.
-        capacity_distribution (List[float]): A list of floats representing the capacity
-                                             distribution across experts. Must sum to 1.0.
-        dtype (torch.dtype, optional): The data type for the module. Defaults to torch.float32.
-
-    Attributes:
-        dim (int): The dimension of the input tokens.
-        capacity_distribution (torch.Tensor): The capacity distribution across experts.
-        dtype (torch.dtype): The data type for the module.
-        tau (float): Current temperature for Gumbel-Softmax.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        capacity_distribution: List[float],
-    ):
-        super().__init__(dim, capacity_distribution)
-        self.capacity_distribution = torch.tensor(capacity_distribution)
-
-    def _compute_router_probs(
-        self, input_tokens: torch.Tensor, tau: float = 1.0, hard: bool = True
-    ) -> torch.Tensor:
-        """
-        Compute the router probabilities for the input tokens using Gumbel-Softmax.
-
-        Args:
-            input_tokens (torch.Tensor): The input tokens of shape [batch_size, seq_length, dim].
-            tau (float): Temperature parameter for Gumbel-Softmax.
-            hard (bool): Whether to return hard one-hot vectors.
-
-        Returns:
-            torch.Tensor: Router probabilities of shape [batch_size, seq_length, num_experts].
-        """
-        logits = self.router(input_tokens)
-
-        if self.training:
-            # Training mode: use Gumbel-Softmax with provided temperature
-            probs = F.gumbel_softmax(logits, tau=tau, hard=hard, dim=-1)
-        else:
-            # Inference mode: use deterministic assignments
-            probs = torch.zeros_like(logits)
-            indices = torch.argmax(logits, dim=-1, keepdim=True)
-            probs.scatter_(-1, indices, 1.0)
-
-        return probs
-
-    def forward(
-        self, input_tokens: torch.Tensor, jitter_noise: float = 0.0, tau: float = 1.0
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the Stochastic Expert Preferred Router (SEPR).
-
-        Args:
-            input_tokens (torch.Tensor): Input tokens of shape [batch_size, seq_length, dim].
-            jitter_noise (float): Jitter noise parameter for Gumbel-Softmax.
-            tau (float): Temperature parameter for Gumbel-Softmax.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - token_mask: Tensor of shape [batch_size, seq_length] with expert assignments.
-                - expert_probs: Tensor of shape [batch_size, seq_length] with expert probabilities.
-                - capacity_loss: Scalar tensor representing the capacity loss (only during training).
-        """
-        # Store original dtype
-        orig_dtype = input_tokens.dtype
-
-        # Compute router probabilities with provided temperature
-        router_probs = self._compute_router_probs(
-            input_tokens.to(torch.float32), tau=tau, hard=True
-        )
-
-        # Convert back to original dtype for subsequent calculations
-        router_probs = router_probs.to(dtype=orig_dtype)
-
-        # Token assignments (indices of the experts)
-        token_mask = torch.argmax(router_probs, dim=-1)
-
-        # Expert probabilities (soft probabilities used for gradient flow)
-        logits = self.router(input_tokens)
-        soft_probs = F.softmax(logits, dim=-1)
-        expert_probs = soft_probs.gather(2, token_mask.unsqueeze(-1)).squeeze(-1)
-
-        # Compute capacity loss only during training
-        if self.training:
-            batch_size, seq_length, _ = router_probs.shape
-            expert_token_counts = router_probs.sum(dim=(0, 1))  # Shape: [num_experts]
-            empirical_capacity = expert_token_counts / (batch_size * seq_length)
-            capacity_loss = F.mse_loss(
-                empirical_capacity,
-                self.capacity_distribution.to(empirical_capacity.device),
-            )
-        else:
-            capacity_loss = torch.tensor(0.0, device=input_tokens.device)
-
-        return token_mask, expert_probs, capacity_loss
-
-
-
 
 class NestedCombine(nn.Module):
     """

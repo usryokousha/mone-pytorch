@@ -1,6 +1,4 @@
 # adapted from dinov2: https://github.com/facebookresearch/dinov2/blob/main/dinov2/layers/attention.py
-import os
-import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,8 +23,18 @@ def _attention(
     x = x.reshape([B, N, dim])
     return x
 
+
 class Attention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, qkv_bias: bool, proj_bias: bool, attn_drop: float, proj_drop: float, qk_scale: Optional[float] = None):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        qkv_bias: bool,
+        proj_bias: bool,
+        attn_drop: float,
+        proj_drop: float,
+        qk_scale: Optional[float] = None,
+    ):
         super().__init__()
         head_dim = dim // num_heads
         self.dim = dim
@@ -34,16 +42,16 @@ class Attention(nn.Module):
         self.attn_drop = attn_drop
         self.scale = head_dim**-0.5 if qk_scale is None else qk_scale
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
-        self.proj_drop = nn.Dropout(proj_drop)
+        self.proj_drop = proj_drop
 
-    def forward(self, x: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
-        qkv = self.qkv(x, expert_mask)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        qkv = self.qkv(x)
         q, k, v = torch.chunk(qkv, 3, dim=-1)
         x = _attention(q, k, v, self.num_heads, self.dim, self.attn_drop, self.scale)
-        x = self.proj(x, expert_mask)
-        x = self.proj_drop(x)
+        x = self.proj(x)
+        x = F.dropout(x, p=self.proj_drop, training=self.training)
         return x
 
 

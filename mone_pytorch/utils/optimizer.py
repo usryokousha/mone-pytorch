@@ -6,7 +6,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from lightning.fabric import Fabric
 from mone_pytorch.optimizer.flora import Flora
 
-from typing import List, Dict, Any, Tuple
+from typing import Collection
 
 
 def scale_lr(
@@ -19,78 +19,26 @@ def scale_lr(
     return lr * (batch_size * grad_accum * num_gpus) / base_batch_size
 
 
-def group_params(
-    model: nn.Module,
-    weight_decay: float = 0.0,
-    decay_modules: Tuple[nn.Module] = (nn.Linear,),
-    no_decay_modules: Tuple[nn.Module] = (nn.LayerNorm, nn.Embedding),
-) -> List[Dict[str, Any]]:
-    """
-    Group model parameters into parameter groups.
-    """
-    decay = set()
-    no_decay = set()
-    special = set()
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    for mod_name, mod in model.named_modules():
-        for param_name, param in mod.named_parameters():
-            full_param_name = f"{mod_name}.{param_name}" if mod_name else param_name
-            if not param.requires_grad or full_param_name not in param_dict:
-                continue  # frozen weights
-            if hasattr(param, "_optim"):
-                special.add(full_param_name)
-            if full_param_name.endswith("bias"):
-                no_decay.add(full_param_name)
-            elif full_param_name.endswith("weight") and isinstance(mod, decay_modules):
-                decay.add(full_param_name)
-            elif full_param_name.endswith("weight") and isinstance(
-                mod, no_decay_modules
-            ):
-                no_decay.add(full_param_name)
-            elif getattr(param, "_no_weight_decay", False):
-                no_decay.add(full_param_name)
+def param_groups_weight_decay(
+        model: nn.Module,
+        weight_decay: float = 1e-5,
+        no_weight_decay_list: Collection[str] = ('pos_embed', 'cls_token'),
+):
+    no_weight_decay_list = set(no_weight_decay_list)
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
 
-    decay |= param_dict.keys() - no_decay - special
-    inter_params = decay & no_decay
-    union_params = decay | no_decay
-    assert (
-        len(inter_params) == 0
-    ), f"parameters {inter_params} are in both decay and no decay!"
-    assert (
-        len(param_dict.keys() - union_params) == 0
-    ), f"parameters {param_dict.keys() - special - union_params} not separated"
+        if param.ndim <= 1 or name.endswith(".bias") or "norm" in name or name in no_weight_decay_list:
+            no_decay.append(param)
+        else:
+            decay.append(param)
 
-    if weight_decay == 0.0 or not no_decay:
-        param_groups = [
-            {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay | decay))],
-                "weight_decay": weight_decay,
-            }
-        ]
-    else:
-        param_groups = [
-            {
-                "params": [param_dict[pn] for pn in sorted(list(decay))],
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
-                "weight_decay": 0.0,
-            },
-        ]
-    # Add parameters with special hyperparameters
-    # Unique dicts
-    hparams = [
-        dict(s) for s in set(frozenset(param_dict[pn]._optim.items()) for pn in special)
-    ]
-    for hparam in hparams:
-        params = [
-            param_dict[pn]
-            for pn in sorted(list(special))
-            if param_dict[pn]._optim == hparam
-        ]
-        param_groups.append({"params": params, **hparam})
-    return param_groups
+    return [
+        {'params': no_decay, 'weight_decay': 0.},
+        {'params': decay, 'weight_decay': weight_decay}]
 
 
 # adapted from Torchtune implementation
@@ -137,7 +85,7 @@ def build_optimizer(
     """
 
     # Group parameters
-    param_groups = group_params(
+    param_groups = param_groups_weight_decay(
         model,
         weight_decay=cfg.optimizer.hparams.weight_decay,
     )
@@ -164,18 +112,18 @@ def build_optimizer(
         fabric.world_size,
     )
 
+    steps_per_epoch = cfg.data.training_size // (
+        cfg.training.batch_size
+        * cfg.training.gradient_accumulation
+        * fabric.world_size
+    )
     training_steps = (
         cfg.training.epochs
-        * cfg.data.training_size
-        // (
-            cfg.training.batch_size
-            * cfg.training.gradient_accumulation
-            * fabric.world_size
-        )
+        * steps_per_epoch
     )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        int(cfg.scheduler.warmup_fraction * training_steps),
+        int(cfg.scheduler.warmup_epochs * steps_per_epoch),
         training_steps,
     )
     fabric.print(f"Total training steps: {training_steps:,}")

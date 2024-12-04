@@ -37,7 +37,7 @@ class MLP(nn.Module):
         return x
 
 
-class SwiGLU(nn.Module):
+class SwiGLUMLP(nn.Module):
     """
     SwiGLU activation function.
     """
@@ -47,18 +47,23 @@ class SwiGLU(nn.Module):
         in_features: int,
         mlp_ratio: int = 2,
         out_features: Optional[int] = None,
+        activation: Callable = nn.SiLU(),
+        drop_rate: float = 0.0,
         bias: bool = True,
+        **kwargs
     ):
         super().__init__()
         self.mlp_ratio = mlp_ratio
         if out_features is None:
             out_features = in_features
+        self.activation = activation
         self.proj1 = nn.Linear(in_features, in_features * mlp_ratio, bias=bias)
         self.proj2 = nn.Linear(in_features * mlp_ratio, out_features, bias=bias)
-
+        self.drop_rate = drop_rate
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1, x2 = torch.chunk(x, 2, dim=-1)
-        x = x1 * F.silu(x2)
+        x = x1 * self.activation(x2)
+        x = F.dropout(x, p=self.drop_rate, training=self.training)
         x = self.proj2(x)
         return x
 
@@ -116,6 +121,7 @@ class NestedSwiGLUMLP(nn.Module):
         out_features: Optional[int] = None,
         activation: Callable = None,
         num_experts: int = 4,
+        drop_rate: float = 0.0,
         bias: bool = True,
     ):
         super().__init__()
