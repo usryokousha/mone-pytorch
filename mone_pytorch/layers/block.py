@@ -3,13 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mone_pytorch.layers.mlp import NestedMLP, MLP
-from mone_pytorch.layers.attention import NestedAttention, Attention, _attention
+from mone_pytorch.layers.attention import Attention, BlockMask
 from mone_pytorch.layers.nested_linear import (
     nested_linear_expand,
     nested_linear_contract,
 )
+from torch.nn.attention.flex_attention import flex_attention
 
-from typing import Optional, Callable
+from typing import Optional, Callable, Union, Tuple
 
 
 # https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/drop.py
@@ -38,318 +39,212 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
-class SequentialBlock(nn.Module):
+class LayerScale(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        init_values: float = 1e-5,
+        inplace: bool = False,
+    ) -> None:
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
+
+
+class Block(nn.Module):
     def __init__(
         self,
         dim: int,
         num_heads: int,
-        mlp_ratio: int = 4,
+        mlp_ratio: float = 4.0,
         qkv_bias: bool = False,
-        qk_scale: Optional[float] = None,
-        proj_bias: bool = True,
-        mlp_bias: bool = True,
-        attn_drop: float = 0.0,
+        qk_norm: bool = False,
         proj_drop: float = 0.0,
-        act_layer: Callable = nn.GELU(),
-        norm_layer: Callable = nn.RMSNorm,
+        attn_drop: float = 0.0,
+        init_values: Optional[float] = None,
+        drop_path: float = 0.0,
+        act_layer: nn.Module = nn.GELU,
+        norm_layer: nn.Module = nn.LayerNorm,
         mlp_layer: nn.Module = MLP,
-        drop_prob: float = 0.0,
-    ):
+        attn_fn: Callable = F.scaled_dot_product_attention,
+    ) -> None:
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.mlp_ratio = mlp_ratio
-        self.qkv_bias = qkv_bias
-        self.qk_scale = qk_scale
-        self.proj_bias = proj_bias
-        self.mlp_bias = mlp_bias
-        self.attn_drop = attn_drop
-        self.proj_drop = proj_drop
-        self.act_layer = act_layer
-        self.norm_layer = norm_layer
-        self.mlp_layer = mlp_layer
         self.norm1 = norm_layer(dim)
-        self.attention = Attention(
-            dim=dim,
+        self.attn = Attention(
+            dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
-            proj_bias=proj_bias,
+            qk_norm=qk_norm,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
+            norm_layer=norm_layer,
+            attn_fn=attn_fn,
         )
+        self.ls1 = (
+            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
             in_features=dim,
-            mlp_ratio=mlp_ratio,
-            activation=act_layer,
-            drop_rate=drop_prob,
-            bias=mlp_bias,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
         )
-        self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
+        self.ls2 = (
+            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.drop_path(self.attention(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[Union[torch.Tensor, BlockMask]] = None,
+        expert_mask: Optional[torch.Tensor] = None,
+        num_experts: int = 1,
+    ) -> torch.Tensor:
+        x = x + self.drop_path1(
+            self.ls1(self.attn(self.norm1(x), mask, expert_mask, num_experts))
+        )
+        x = x + self.drop_path2(
+            self.ls2(self.mlp(self.norm2(x), expert_mask, num_experts))
+        )
         return x
 
 
-class NestedSequentialBlock(nn.Module):
+class ParallelBlock(nn.Module):
+    """Parallel ViT block (MLP & Attention in parallel)
+    Based on:
+      'Scaling Vision Transformers to 22 Billion Parameters` - https://arxiv.org/abs/2302.05442
+    """
+
     def __init__(
         self,
         dim: int,
         num_heads: int,
-        num_experts: int,
-        mlp_ratio: int = 4,
+        mlp_ratio: float = 4.0,
         qkv_bias: bool = False,
-        qk_scale: Optional[float] = None,
-        proj_bias: bool = True,
-        mlp_bias: bool = True,
-        attn_drop: float = 0.0,
+        qk_norm: bool = True,
         proj_drop: float = 0.0,
-        act_layer: Callable = nn.GELU(),
-        norm_layer: Callable = nn.LayerNorm,
-        mlp_layer: nn.Module = NestedMLP,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.num_experts = num_experts
-        self.norm1 = norm_layer(dim)
-        self.attention = NestedAttention(
-            dim,
-            num_heads,
-            num_experts,
-            qkv_bias,
-            qk_scale,
-            proj_bias,
-            attn_drop=attn_drop,
-        )
-        self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
-            dim,
-            mlp_ratio,
-            num_experts=num_experts,
-            activation=act_layer,
-            drop_rate=proj_drop,
-            bias=mlp_bias,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        expert_mask: torch.Tensor,
-        expert_probs: Optional[torch.Tensor] = None,
-        alpha: Optional[float] = None,
-    ) -> torch.Tensor:
-        # As described in the paper
-        z = x + self.attention(self.norm1(x), expert_mask)
-        z_prime = self.mlp(self.norm2(z), expert_mask)
-
-        if alpha is None:
-            output_tokens = z + expert_probs.unsqueeze(-1) * z_prime
-        else:
-            output_tokens = z + (alpha * expert_probs.unsqueeze(-1) + 1) * z_prime
-        return output_tokens
-
-
-class ParallelBlock(nn.Module):
-    """Naive parallel block as in https://arxiv.org/pdf/2302.05442"""
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        mlp_ratio: int = 4,
-        qkv_bias: bool = False,
-        qk_scale: Optional[float] = None,
-        proj_bias: bool = True,
-        drop_prob: float = 0.0,
-        act_layer: Callable = nn.GELU(),
         attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        norm_layer: Callable = nn.RMSNorm,
-        **kwargs
-    ):
-        super().__init__()
-        expand_dim = 3 * dim + mlp_ratio * dim
-        contract_dim = 2 * dim
-        concat_dim = mlp_ratio * dim + dim
-        self.dim = dim
-        self.mlp_ratio = mlp_ratio
-        self.qkv_bias = qkv_bias
-        self.qk_scale = qk_scale
-        self.proj_bias = proj_bias
-        self.drop_prob = drop_prob
-        self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(2 * dim)
-        self.num_heads = num_heads
-        self.attn_drop = attn_drop
-        self.proj_drop = proj_drop
-        self.scale = qk_scale or (dim // num_heads) ** -0.5
-        self.act_layer = act_layer
-        self.expand_weight = nn.Parameter(torch.zeros((expand_dim, dim)))
-        self.contract_weight = nn.Parameter(torch.zeros((contract_dim, concat_dim)))
-        self.mlp_bias = nn.Parameter(torch.zeros((mlp_ratio * dim,)))
-        self.contract_bias = nn.Parameter(torch.zeros((contract_dim,)))
-        if qkv_bias:
-            self.qkv_bias = nn.Parameter(torch.zeros((3 * dim,)))
-        else:
-            self.qkv_bias = None
-        self.drop_path = DropPath(drop_prob) if drop_prob > 0.0 else nn.Identity()
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.expand_weight, std=0.02)
-        nn.init.trunc_normal_(self.contract_weight, std=0.02)
-        nn.init.zeros_(self.mlp_bias)
-        nn.init.zeros_(self.contract_bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        if self.qkv_bias is None:
-            input_bias = torch.cat(
-                [
-                    self.mlp_bias,
-                    torch.zeros(
-                        (3 * self.dim,),
-                        dtype=self.mlp_bias.dtype,
-                        device=self.mlp_bias.device,
-                    ),
-                ]
-            )
-        else:
-            input_bias = torch.cat([self.mlp_bias, self.qkv_bias], dim=-1)
-        qkv, mlp_hidden = torch.split(
-            F.linear(self.norm1(x), self.expand_weight, bias=input_bias),
-            [3 * self.dim, self.mlp_ratio * self.dim],
-            dim=-1,
-        )
-        mlp_hidden = F.dropout(
-            self.act_layer(mlp_hidden), self.proj_drop, self.training
-        )
-        q, kv = torch.split(qkv, [self.dim, 2 * self.dim], dim=-1)
-        k, v = torch.chunk(self.norm2(kv), 2, dim=-1)
-        attn_output = _attention(
-            q, k, v, self.num_heads, self.dim, self.attn_drop, self.scale
-        )
-        mlp_output, attn_output = torch.chunk(
-            F.linear(
-                torch.cat([mlp_hidden, attn_output], dim=-1),
-                self.contract_weight,
-                bias=self.contract_bias,
-            ),
-            2,
-            dim=-1,
-        )
-        attn_output = F.dropout(attn_output, self.proj_drop, self.training)
-        output = self.drop_path(attn_output + mlp_output)
-        output = output + residual
-        return output
-
-
-class NestedParallelBlock(nn.Module):
-    """Nested parallel block adapted from https://arxiv.org/pdf/2302.05442"""
-
-    def __init__(
-        self,
-        dim: int,
-        num_experts: int,
-        mlp_ratio: int = 4,
-        qkv_bias: bool = False,
-        qk_scale: Optional[float] = None,
-        num_heads: int = 8,
-        act_layer: Callable = nn.GELU(),
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
+        init_values: Optional[float] = None,
+        drop_path: float = 0.0,
+        act_layer: nn.Module = nn.GELU,
         norm_layer: nn.Module = nn.LayerNorm,
-        **kwargs
-    ):
+        mlp_layer: Optional[nn.Module] = None,  # placeholder for nested mlp
+        attn_fn: Callable = F.scaled_dot_product_attention,
+    ) -> None:
         super().__init__()
-        expand_dim = 3 * dim + mlp_ratio * dim
-        self.dim = dim
-        self.num_experts = num_experts
-        self.attn_drop = attn_drop
-        self.proj_drop = proj_drop
-        self.mlp_ratio = mlp_ratio
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
         self.num_heads = num_heads
-        self.act_layer = act_layer
-        self.expand_weight = nn.Parameter(torch.zeros((expand_dim, dim)))
-        self.mlp_bias = nn.Parameter(torch.zeros((mlp_ratio * dim,)))
-        if qkv_bias:
-            self.qkv_bias = nn.Parameter(torch.zeros((3 * dim,)))
-        else:
-            self.qkv_bias = None
-        contract_dim = 2 * dim
-        concat_dim = mlp_ratio * dim + dim
-        self.contract_weight = nn.Parameter(torch.zeros((contract_dim, concat_dim)))
-        self.contract_bias = nn.Parameter(torch.zeros((contract_dim,)))
-        self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(2 * dim)
-        self.scale = qk_scale or (dim // num_heads) ** -0.5
-        self._init_weights()
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        mlp_hidden_dim = int(mlp_ratio * dim)
+        in_proj_out_dim = mlp_hidden_dim + 3 * dim
 
-    def _init_weights(self):
-        nn.init.trunc_normal_(self.expand_weight, std=0.02)
-        nn.init.trunc_normal_(self.contract_weight, std=0.02)
-        nn.init.zeros_(self.mlp_bias)
-        nn.init.zeros_(self.contract_bias)
+        self.in_norm = norm_layer(dim)
+        self.in_proj = nn.Linear(dim, in_proj_out_dim, bias=qkv_bias)
+        self.in_split = [mlp_hidden_dim] + [dim] * 3
+        if qkv_bias:
+            self.register_buffer("qkv_bias", None)
+            self.register_parameter("mlp_bias", None)
+        else:
+            self.register_buffer("qkv_bias", torch.zeros(3 * dim), persistent=False)
+            self.mlp_bias = nn.Parameter(torch.zeros(mlp_hidden_dim))
+
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.out_proj = nn.Linear(mlp_hidden_dim + dim, 2 * dim)
+
+        self.mlp_drop = nn.Dropout(proj_drop)
+        self.mlp_act = act_layer()
+
+        self.ls = (
+            LayerScale(dim, init_values=init_values)
+            if init_values is not None
+            else nn.Identity()
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.attn_fn = attn_fn
 
     def forward(
         self,
         x: torch.Tensor,
-        expert_mask: torch.Tensor,
-        expert_probs: Optional[torch.Tensor] = None,
-        alpha: Optional[float] = None,
+        mask: Optional[Union[torch.Tensor, BlockMask]] = None,
+        expert_mask: Optional[torch.Tensor] = None,
+        num_experts: int = 1,
     ) -> torch.Tensor:
-        residual = x
-        if self.qkv_bias is None:
-            input_bias = torch.cat(
-                [
-                    self.mlp_bias,
-                    torch.zeros(
-                        (3 * self.dim,),
-                        dtype=self.mlp_bias.dtype,
-                        device=self.mlp_bias.device,
-                    ),
-                ],
-                dim=-1,
+        B, N, C = x.shape
+
+        # Combined MLP fc1 & qkv projections
+        y = self.in_norm(x)
+        # Combine the bias terms
+        bias = torch.cat((self.qkv_bias, self.mlp_bias)) if self.mlp_bias is not None else self.qkv_bias
+        
+        # Apply linear transformation with appropriate function based on num_experts
+        if num_experts > 1:
+            y = nested_linear_expand(
+                y,
+                self.in_proj.weight,
+                expert_mask,
+                bias,
+                num_experts,
             )
         else:
-            input_bias = torch.cat([self.mlp_bias, self.qkv_bias], dim=-1)
-        qkv, mlp_hidden = torch.split(
-            nested_linear_expand(
-                self.norm1(x), self.expand_weight, expert_mask, input_bias
-            ),
-            [3 * self.dim, self.mlp_ratio * self.dim],
-            dim=-1,
-        )
-        q, kv = torch.split(qkv, [self.dim, 2 * self.dim], dim=-1)
-        k, v = torch.chunk(self.norm2(kv), 2, dim=-1)
-        attn_output = _attention(
-            q, k, v, self.num_heads, self.dim, self.attn_drop, self.scale
-        )
+            y = F.linear(y, self.in_proj.weight, bias) if bias is not None else self.in_proj(y)
+            
+        x_mlp, q, k, v = torch.split(y, self.in_split, dim=-1)
 
-        concat_output = nested_linear_contract(
-            torch.cat(
-                [
-                    F.dropout(
-                        self.act_layer(mlp_hidden), self.proj_drop, self.training
-                    ),
-                    attn_output,
-                ],
-                dim=-1,
-            ),
-            self.contract_weight,
-            expert_mask,
-            self.contract_bias,
-        )
-        # add residual to concat_output
-        mlp_output, attn_output = torch.chunk(
-            concat_output + residual.repeat(1, 1, 2), 2, dim=-1
-        )
-        if alpha is None:
-            output = attn_output + expert_probs.unsqueeze(-1) * mlp_output
+        # Dot product attention w/ qk norm
+        q = self.q_norm(q.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(k.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.attn_fn is F.scaled_dot_product_attention:
+            assert isinstance(
+                mask, torch.Tensor
+            ), "block_mask must be a tensor for scaled_dot_product_attention"
+            x_attn = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+        elif self.attn_fn is flex_attention:
+            assert isinstance(
+                mask, BlockMask
+            ), "block_mask must be a BlockMask for flex_attention"
+            x_attn = flex_attention(q, k, v, block_mask=mask, scale=self.scale)
+            x_attn = F.dropout(x_attn, p=self.attn_drop, training=self.training)
         else:
-            output = attn_output + (alpha * expert_probs.unsqueeze(-1) + 1) * mlp_output
-        return output
+            raise ValueError(f"Unsupported attention function: {self.attn_fn}")
+
+        x_attn = x_attn.transpose(1, 2).reshape(B, N, C)
+
+        # MLP activation, dropout, fc2
+        x_mlp = self.mlp_act(x_mlp)
+        x_mlp = self.mlp_drop(x_mlp)
+        x_mlp_attn = torch.cat([x_mlp, x_attn], dim=-1)
+        if num_experts > 1:
+            x_mlp_attn = nested_linear_contract(
+                x_mlp_attn,
+                self.out_proj.weight,
+                expert_mask,
+                self.out_proj.bias,
+                num_experts,
+            )
+        else:
+            x_mlp_attn = self.out_proj(x_mlp_attn)
+        x_mlp_out, x_attn_out = torch.chunk(x_mlp_attn, 2, dim=-1)
+
+        # Add residual w/ drop path & layer scale applied
+        y = self.drop_path(self.ls(x_attn_out + x_mlp_out))
+        x = x + y
+        return x
+
+

@@ -13,7 +13,7 @@ from mone_pytorch.layers.block import NestedSequentialBlock, NestedParallelBlock
 from mone_pytorch.layers.mlp import NestedMLP, NestedSwiGLUMLP
 from mone_pytorch.layers.routing import EPR
 
-from typing import Tuple
+from typing import Union, Tuple
 
 mlp_layer = {
     "mlp": NestedMLP,
@@ -60,6 +60,7 @@ class NestedVisionTransformer(nn.Module):
         block_layer=NestedSequentialBlock,
         shared_router=False,
         router_layer=EPR,
+        mask_window_size=None,
     ):
         super().__init__()
         assert (
@@ -68,6 +69,7 @@ class NestedVisionTransformer(nn.Module):
         self.num_features = self.embed_dim = embed_dim
         self.num_routers = num_routers
         self.shared_router = shared_router
+        self.mask_window_size = mask_window_size
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
@@ -128,6 +130,11 @@ class NestedVisionTransformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def update_patch_size(self, new_size: Union[int, Tuple[int, int]]) -> None:
+        self.patch_embed.update_patch_size(new_size)
+        for block in self.blocks:
+            block.update_block_mask(new_size, self.mask_window_size, 0)
 
     def interpolate_pos_encoding(self, x, w, h):
         npatch = x.shape[1]

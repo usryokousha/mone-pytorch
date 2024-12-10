@@ -9,8 +9,10 @@ import torch
 import torch.nn as nn
 
 from mone_pytorch.layers.patch_embed import PatchEmbed
-from mone_pytorch.layers.block import SequentialBlock, ParallelBlock
+from mone_pytorch.layers.block import Block, ParallelBlock
 from mone_pytorch.layers.mlp import MLP, SwiGLUMLP
+
+from typing import Union, Tuple, Set, Optional
 
 mlp_layer = {
     "mlp": MLP,
@@ -18,20 +20,14 @@ mlp_layer = {
 }
 
 block_layer = {
-    "sequential": SequentialBlock,
+    "sequential": Block,
     "parallel": ParallelBlock,
 }
 
 
-def vit(
-    block_type: str = "sequential",
-    mlp_type: str = "mlp",
-    **kwargs
-):
+def vit(block_type: str = "sequential", mlp_type: str = "mlp", **kwargs):
     return VisionTransformer(
-        block_layer=block_layer[block_type],
-        mlp_layer=mlp_layer[mlp_type],
-        **kwargs
+        block_layer=block_layer[block_type], mlp_layer=mlp_layer[mlp_type], **kwargs
     )
 
 
@@ -56,7 +52,7 @@ class VisionTransformer(nn.Module):
         attn_drop_rate=0.0,
         norm_layer=nn.RMSNorm,
         mlp_layer=MLP,
-        block_layer=SequentialBlock,
+        block_layer=Block,
     ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
@@ -112,16 +108,27 @@ class VisionTransformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    @torch.jit.ignore
+    def no_weight_decay(self) -> Set:
+        return {"pos_embed", "cls_token"}
+
+    def set_input_size(
+        self,
+        img_size: Optional[Union[int, Tuple[int, int]]] = None,
+        patch_size: Optional[Union[int, Tuple[int, int]]] = None,
+    ):
+        self.patch_embed.set_input_size(img_size, patch_size)
+
     def interpolate_pos_encoding(self, x, w, h):
         npatch = x.shape[1] - 1  # Remove cls token
         N = self.pos_embed.shape[1] - 1  # Remove cls token position
         if npatch == N and w == h:
             return self.pos_embed.to(x.dtype)
-        
+
         # Only interpolate patch position embeddings, handle cls token separately
         cls_pos_embed = self.pos_embed[:, 0:1]
         patch_pos_embed = self.pos_embed[:, 1:]
-        
+
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size

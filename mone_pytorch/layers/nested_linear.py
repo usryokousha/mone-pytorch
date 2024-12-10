@@ -60,25 +60,25 @@ def nested_linear_expand(
     input_shape = x.shape
     batch_seq = x.shape[:-1].numel()
 
-    # Initialize output tensor with same dtype as input
-    output = torch.zeros(
-        (batch_seq, out_dim), device=x.device, dtype=x.dtype
-    )
+    # Reshape input and pad to output dimension
     x = x.reshape(batch_seq, in_dim)
+    x = F.pad(x, (0, out_dim - in_dim))
+
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (expert_mask == m).view(batch_seq)
+        if not valid_mask.any():
+            continue
 
         D_m = in_dim >> (num_experts - m - 1)
 
-        # slice the input and weight
-        x_m = x[valid_mask, :D_m]
+        # slice weight to match input dimension
         w_m = w[:, :D_m]
 
-        # project up to the expert dim
-        output[valid_mask, :] = F.linear(x_m, w_m, b)
+        # project input and update in-place
+        x[valid_mask] = F.linear(x[valid_mask, :D_m], w_m, b)
 
-    return output.reshape(input_shape[:-1] + (out_dim,))
+    return x.reshape(input_shape[:-1] + (out_dim,))
 
 
 def nested_linear_contract(
@@ -94,9 +94,6 @@ def nested_linear_contract(
     batch_seq = x.shape[:-1].numel()
 
     # Initialize output tensor with same dtype as input
-    output = torch.zeros(
-        (batch_seq, out_dim), device=x.device, dtype=x.dtype
-    )
     x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         # get the valid mask for the m-th expert
@@ -104,8 +101,7 @@ def nested_linear_contract(
 
         D_m = out_dim >> (num_experts - m - 1)
 
-        # get the m-th expert's input and sliced weight
-        x_m = x[valid_mask]
+        # slice weight to match input dimension
         w_m = w[:D_m, :]
 
         # project down to the expert dim
@@ -115,10 +111,9 @@ def nested_linear_contract(
             b_m = None
 
         # Avoid explicit padding
-        y = F.linear(x_m, w_m, b_m)
-        output[valid_mask, :D_m] = y
+        x[valid_mask, :D_m] = F.linear(x[valid_mask], w_m, b_m)
 
-    return output.reshape(input_shape[:-1] + (out_dim,))
+    return x.reshape(input_shape[:-1] + (out_dim,))
 
 
 def nested_mlp(
@@ -140,9 +135,6 @@ def nested_mlp(
     batch_seq = x.shape[:-1].numel()
 
     # Initialize output tensor with same dtype as input
-    output = torch.zeros(
-        (batch_seq, out_dim), device=x.device, dtype=x.dtype
-    )
     x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         valid_mask = (expert_mask == m).view(batch_seq)
@@ -160,9 +152,9 @@ def nested_mlp(
         else:
             b_m = None
         y_m = F.linear(x_m, w_m, b_m)
-        output[valid_mask, :D_m_out] = F.dropout(y_m, drop_rate, training)
+        x[valid_mask, :D_m_out] = F.dropout(y_m, drop_rate, training)
 
-    return output.reshape(input_shape[:-1] + (out_dim,))
+    return x.reshape(input_shape[:-1] + (out_dim,))
 
 def nested_swiglu_mlp(
     x: torch.Tensor,
@@ -180,9 +172,6 @@ def nested_swiglu_mlp(
     batch_seq = x.shape[:-1].numel()
 
     # Initialize output tensor with same dtype as input
-    output = torch.zeros(
-        (batch_seq, out_dim), device=x.device, dtype=x.dtype
-    )
     x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         valid_mask = (expert_mask == m).view(batch_seq)
@@ -203,9 +192,9 @@ def nested_swiglu_mlp(
         else:
             b_m = None
         y = F.linear(x_m, w_m, b_m)
-        output[valid_mask, :D_m_out] = y
+        x[valid_mask, :D_m_out] = y
 
-    return output.reshape(input_shape[:-1] + (out_dim,))
+    return x.reshape(input_shape[:-1] + (out_dim,))
 
 
 if __name__ == "__main__":
