@@ -7,7 +7,7 @@ from torch.optim.swa_utils import get_ema_multi_avg_fn, AveragedModel
 from mone_pytorch.utils.flops import profile_fvcore
 
 from mone_pytorch.data.dataloader import build_dataloaders
-from mone_pytorch.train.initialize import initialize_model
+from mone_pytorch.models.vit import build_vit
 from mone_pytorch.utils.optimizer import build_optimizer
 from mone_pytorch.layers.routing import CapacityScheduler, compute_capacity_distribution
 from mone_pytorch.utils.augmentation import CutMixup
@@ -181,7 +181,12 @@ def main(cfg: DictConfig):
 
     # Create model with MoNE initialization
     with fabric.init_module():
-        model = initialize_model(cfg, fabric)
+        model = build_vit(
+            block_type=cfg.model.block_type,
+            mlp_type=cfg.model.mlp_type,
+            attention_type=cfg.model.attention_type,
+            **cfg.model.kwargs,
+        )
 
     # Create optimizer and scheduler
     optimizer, scheduler = build_optimizer(cfg, model, fabric)

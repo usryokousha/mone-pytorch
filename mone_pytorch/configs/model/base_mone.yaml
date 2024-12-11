@@ -12,3 +12,4 @@ block_type: parallel
 num_routers: ${mone.num_experts}
 num_experts: ${mone.num_experts}
 router_bias: ${mone.router_bias}
+attention_type: flex

@@ -9,3 +9,4 @@ img_size: 224
 num_classes: ${data.num_classes}
 mlp_type: mlp
 block_type: parallel
+attention_type: flex
