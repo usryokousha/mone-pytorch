@@ -1,0 +1,14 @@
+name: vit-base
+embed_dim: 768
+depth: 12
+num_heads: 12
+mlp_ratio: 4
+qkv_bias: false
+patch_size: 16
+img_size: 224
+num_classes: ${data.num_classes}
+mlp_type: mlp
+block_type: parallel
+num_routers: ${mone.num_experts}
+num_experts: ${mone.num_experts}
+router_bias: ${mone.router_bias}

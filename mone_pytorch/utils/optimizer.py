@@ -1,4 +1,5 @@
 import math
+import logging
 from omegaconf import DictConfig
 import torch
 import torch.nn as nn
@@ -8,21 +9,31 @@ from mone_pytorch.optimizer.flora import Flora
 
 from typing import Collection
 
+logger = logging.getLogger(__name__)
+
 
 def scale_lr(
-    lr: float,
+    fabric: Fabric,
+    base_lr: float,
     batch_size: int,
     grad_accum: int,
-    num_gpus: int,
     base_batch_size: int = 256,
 ) -> float:
-    return lr * (batch_size * grad_accum * num_gpus) / base_batch_size
+    global_batch_size = batch_size * grad_accum * fabric.world_size
+    batch_size_ratio = global_batch_size / base_batch_size
+    lr = base_lr * batch_size_ratio
+    fabric.print(
+        f"Learning rate is scaled linearly from {base_lr} to {lr} "
+        f"for effective batch size {global_batch_size}"
+    )
+    return lr
 
 
+# taken from https://github.com/huggingface/pytorch-image-models/blob/main/timm/optim/_param_groups.py
 def param_groups_weight_decay(
-        model: nn.Module,
-        weight_decay: float = 1e-5,
-        no_weight_decay_list: Collection[str] = ('pos_embed', 'cls_token'),
+    model: nn.Module,
+    weight_decay: float = 1e-5,
+    no_weight_decay_list: Collection[str] = (),
 ):
     no_weight_decay_list = set(no_weight_decay_list)
     decay = []
@@ -31,14 +42,15 @@ def param_groups_weight_decay(
         if not param.requires_grad:
             continue
 
-        if param.ndim <= 1 or name.endswith(".bias") or "norm" in name or name in no_weight_decay_list:
+        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list:
             no_decay.append(param)
         else:
             decay.append(param)
 
     return [
-        {'params': no_decay, 'weight_decay': 0.},
-        {'params': decay, 'weight_decay': weight_decay}]
+        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay, "weight_decay": weight_decay},
+    ]
 
 
 # adapted from Torchtune implementation
@@ -85,9 +97,12 @@ def build_optimizer(
     """
 
     # Group parameters
+    weight_decay = cfg.optimizer.hparams.weight_decay
+    no_weight_decay = getattr(model, "no_weight_decay", lambda: set())()
     param_groups = param_groups_weight_decay(
         model,
-        weight_decay=cfg.optimizer.hparams.weight_decay,
+        weight_decay=weight_decay,
+        no_weight_decay_list=no_weight_decay,
     )
 
     # Initialize optimizer - modify this line
@@ -105,27 +120,23 @@ def build_optimizer(
     else:
         raise ValueError(f"Optimizer {cfg.optimizer.name} not supported")
 
-    optimizer.param_groups[0]["lr"] = scale_lr(
+    effective_lr = scale_lr(
+        fabric,
         cfg.optimizer.hparams.lr,
         cfg.training.batch_size,
         cfg.training.gradient_accumulation,
-        fabric.world_size,
     )
+    optimizer.param_groups[0]["lr"] = effective_lr
 
-    steps_per_epoch = cfg.data.training_size // (
-        cfg.training.batch_size
-        * cfg.training.gradient_accumulation
-        * fabric.world_size
+    effective_batch_size = (
+        cfg.training.batch_size * cfg.training.gradient_accumulation * fabric.world_size
     )
-    training_steps = (
-        cfg.training.epochs
-        * steps_per_epoch
-    )
+    steps_per_epoch = cfg.data.training_size // effective_batch_size
+    training_steps = cfg.training.epochs * steps_per_epoch
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         int(cfg.scheduler.warmup_epochs * steps_per_epoch),
         training_steps,
     )
     fabric.print(f"Total training steps: {training_steps:,}")
-
     return optimizer, scheduler

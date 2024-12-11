@@ -4,6 +4,9 @@ import torch.nn.functional as F
 
 from typing import Optional, Callable
 
+def _check_nested_linear(expert_mask: torch.Tensor, num_experts: int) -> bool:
+    return expert_mask is not None and num_experts > 1
+
 class NestedLinearExpand(nn.Linear):
     """Performs a linear projection expansion with a nested expert mask"""
     def __init__(

@@ -1,5 +1,5 @@
 defaults:
-  - mone: default
+  - mone: null
   - model: base
   - optimizer: adamw
   - data: imagenet1k

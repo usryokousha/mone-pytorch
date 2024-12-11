@@ -230,7 +230,7 @@ def _linear_annealing(
     return max_val - (max_val - min_val) * (adjusted_step / total_steps)
 
 
-class CapacityScheduler:
+class CapacityScheduler(nn.Module):
     def __init__(
         self,
         patch_size: int,
@@ -243,6 +243,7 @@ class CapacityScheduler:
         beta: float = 10,
         annealing_type: str = "cosine",
     ):
+        super().__init__()
         self.patch_size = patch_size
         self.image_size = image_size
         self.max_epochs = max_epochs
@@ -252,51 +253,95 @@ class CapacityScheduler:
         self.delta = delta
         self.beta = beta
         self.annealing_type = annealing_type
-        self.start_epoch = 0
-        self.epoch = 0
+        
+        # Register buffers for stateful variables
+        self.register_buffer('start_epoch', torch.tensor(0))
+        self.register_buffer('epoch', torch.tensor(0))
+        self.register_buffer('effective_capacity', torch.tensor(max_capacity))
+        self.register_buffer('capacity_distribution', 
+            torch.zeros(num_experts, dtype=torch.float32))
 
-    def update(self) -> float:
+    def update(self) -> Tuple[torch.Tensor, int]:
         # Update the epoch
         self.epoch += 1
 
         # Compute the effective capacity for the current step
         if self.annealing_type == "exponential":
-            self.effective_capacity = _exponential_annealing(
-                self.epoch,
-                self.start_epoch,
+            self.effective_capacity = torch.tensor(_exponential_annealing(
+                int(self.epoch.item()),
+                int(self.start_epoch.item()),
                 self.max_epochs,
                 self.min_capacity,
                 self.max_capacity,
-            )
+            ))
         elif self.annealing_type == "cosine":
-            self.effective_capacity = _cosine_annealing(
-                self.epoch,
-                self.start_epoch,
+            self.effective_capacity = torch.tensor(_cosine_annealing(
+                int(self.epoch.item()),
+                int(self.start_epoch.item()),
                 self.max_epochs,
                 self.min_capacity,
                 self.max_capacity,
-            )
+            ))
         elif self.annealing_type == "linear":
-            self.effective_capacity = _linear_annealing(
-                self.epoch,
-                self.start_epoch,
+            self.effective_capacity = torch.tensor(_linear_annealing(
+                int(self.epoch.item()),
+                int(self.start_epoch.item()),
                 self.max_epochs,
                 self.min_capacity,
                 self.max_capacity,
-            )
+            ))
 
         # Compute the capacity distribution based on new effective capacity
-        self.capacity_distribution = compute_capacity_distribution(
-            self.num_experts, self.effective_capacity, self.delta, self.beta
-        )
+        self.capacity_distribution = torch.tensor(compute_capacity_distribution(
+            self.num_experts, 
+            float(self.effective_capacity.item()), 
+            self.delta, 
+            self.beta
+        ))
 
         return self.capacity_distribution, self.adjusted_patch_size
 
+    def reset(self):
+        """Reset the scheduler state"""
+        self.epoch.zero_()
+        self.effective_capacity.fill_(self.max_capacity)
+        
+    def state_dict(self, *args, **kwargs):
+        state_dict = super().state_dict(*args, **kwargs)
+        # Add any additional state that's not captured by buffers
+        state_dict.update({
+            'patch_size': self.patch_size,
+            'image_size': self.image_size,
+            'max_epochs': self.max_epochs,
+            'min_capacity': self.min_capacity,
+            'max_capacity': self.max_capacity,
+            'num_experts': self.num_experts,
+            'delta': self.delta,
+            'beta': self.beta,
+            'annealing_type': self.annealing_type,
+        })
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        # Extract configuration parameters
+        self.patch_size = state_dict.pop('patch_size')
+        self.image_size = state_dict.pop('image_size')
+        self.max_epochs = state_dict.pop('max_epochs')
+        self.min_capacity = state_dict.pop('min_capacity')
+        self.max_capacity = state_dict.pop('max_capacity')
+        self.num_experts = state_dict.pop('num_experts')
+        self.delta = state_dict.pop('delta')
+        self.beta = state_dict.pop('beta')
+        self.annealing_type = state_dict.pop('annealing_type')
+        
+        # Load the remaining state (buffers)
+        super().load_state_dict(state_dict, strict=strict)
+
     @property
-    def adjusted_patch_size(self) -> int:
-        # Calculate patch size based on effective capacity and ensure it's even
-        patch_size = max(1, int(self.patch_size * self.effective_capacity))
-        return patch_size if patch_size % 2 == 0 else patch_size + 1
+    def adjusted_patch_size(self) -> torch.Tensor:
+        # Calculate patch size based on effective capacity and ensure it's the next even number
+        patch_size = torch.maximum(torch.tensor(1), (self.patch_size * self.effective_capacity).int())
+        return patch_size + (patch_size % 2)
 
 
 if __name__ == "__main__":

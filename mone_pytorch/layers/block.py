@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mone_pytorch.layers.mlp import NestedMLP, MLP
+from mone_pytorch.layers.mlp import MLP
 from mone_pytorch.layers.attention import Attention, BlockMask
 from mone_pytorch.layers.nested_linear import (
     nested_linear_expand,
@@ -10,7 +10,7 @@ from mone_pytorch.layers.nested_linear import (
 )
 from torch.nn.attention.flex_attention import flex_attention
 
-from typing import Optional, Callable, Union, Tuple
+from typing import Optional, Callable, Union
 
 
 # https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/drop.py
@@ -100,19 +100,33 @@ class Block(nn.Module):
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
+    def _nested_combine(
+        self,
+        attn_output: torch.Tensor,
+        mlp_output: torch.Tensor,
+        expert_prob: torch.Tensor,
+        alpha: float = 0.0,
+    ) -> torch.Tensor:
+        return attn_output + (alpha * expert_prob + 1.0) * mlp_output
+
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[Union[torch.Tensor, BlockMask]] = None,
+        attn_mask: Optional[Union[torch.Tensor, BlockMask]] = None,
         expert_mask: Optional[torch.Tensor] = None,
+        expert_prob: Optional[torch.Tensor] = None,
+        alpha: float = 0.0,
         num_experts: int = 1,
     ) -> torch.Tensor:
         x = x + self.drop_path1(
-            self.ls1(self.attn(self.norm1(x), mask, expert_mask, num_experts))
+            self.ls1(self.attn(self.norm1(x), attn_mask, expert_mask, num_experts))
         )
-        x = x + self.drop_path2(
-            self.ls2(self.mlp(self.norm2(x), expert_mask, num_experts))
-        )
+        if num_experts > 1:
+            x = self._nested_combine(x, self.mlp(self.norm2(x), expert_mask, expert_prob, alpha))
+        else:   
+            x = x + self.drop_path2(
+                self.ls2(self.mlp(self.norm2(x)))
+            )
         return x
 
 
@@ -135,8 +149,8 @@ class ParallelBlock(nn.Module):
         drop_path: float = 0.0,
         act_layer: nn.Module = nn.GELU,
         norm_layer: nn.Module = nn.LayerNorm,
-        mlp_layer: Optional[nn.Module] = None,  # placeholder for nested mlp
         attn_fn: Callable = F.scaled_dot_product_attention,
+        **kwargs,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -172,11 +186,23 @@ class ParallelBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.attn_fn = attn_fn
 
+    def _nested_combine(
+        self,
+        attn_output: torch.Tensor,
+        mlp_output: torch.Tensor,
+        residual: torch.Tensor,
+        expert_prob: torch.Tensor,
+        alpha: float = 0.0,
+    ) -> torch.Tensor:
+        return (alpha * expert_prob + 1.0) * self.ls(mlp_output + attn_output) + residual
+
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[Union[torch.Tensor, BlockMask]] = None,
+        attn_mask: Optional[Union[torch.Tensor, BlockMask]] = None,
         expert_mask: Optional[torch.Tensor] = None,
+        expert_prob: Optional[torch.Tensor] = None,
+        alpha: float = 0.0,
         num_experts: int = 1,
     ) -> torch.Tensor:
         B, N, C = x.shape
@@ -184,8 +210,12 @@ class ParallelBlock(nn.Module):
         # Combined MLP fc1 & qkv projections
         y = self.in_norm(x)
         # Combine the bias terms
-        bias = torch.cat((self.qkv_bias, self.mlp_bias)) if self.mlp_bias is not None else self.qkv_bias
-        
+        bias = (
+            torch.cat((self.qkv_bias, self.mlp_bias))
+            if self.mlp_bias is not None
+            else self.qkv_bias
+        )
+
         # Apply linear transformation with appropriate function based on num_experts
         if num_experts > 1:
             y = nested_linear_expand(
@@ -196,8 +226,12 @@ class ParallelBlock(nn.Module):
                 num_experts,
             )
         else:
-            y = F.linear(y, self.in_proj.weight, bias) if bias is not None else self.in_proj(y)
-            
+            y = (
+                F.linear(y, self.in_proj.weight, bias)
+                if bias is not None
+                else self.in_proj(y)
+            )
+
         x_mlp, q, k, v = torch.split(y, self.in_split, dim=-1)
 
         # Dot product attention w/ qk norm
@@ -205,9 +239,9 @@ class ParallelBlock(nn.Module):
         k = self.k_norm(k.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if self.attn_fn is F.scaled_dot_product_attention:
+        if isinstance(self.attn_fn, F.scaled_dot_product_attention):
             assert isinstance(
-                mask, torch.Tensor
+                attn_mask, torch.Tensor
             ), "block_mask must be a tensor for scaled_dot_product_attention"
             x_attn = F.scaled_dot_product_attention(
                 q,
@@ -215,11 +249,11 @@ class ParallelBlock(nn.Module):
                 v,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )
-        elif self.attn_fn is flex_attention:
+        elif isinstance(self.attn_fn, flex_attention):
             assert isinstance(
-                mask, BlockMask
+                attn_mask, BlockMask
             ), "block_mask must be a BlockMask for flex_attention"
-            x_attn = flex_attention(q, k, v, block_mask=mask, scale=self.scale)
+            x_attn = flex_attention(q, k, v, block_mask=attn_mask, scale=self.scale)
             x_attn = F.dropout(x_attn, p=self.attn_drop, training=self.training)
         else:
             raise ValueError(f"Unsupported attention function: {self.attn_fn}")
@@ -242,9 +276,15 @@ class ParallelBlock(nn.Module):
             x_mlp_attn = self.out_proj(x_mlp_attn)
         x_mlp_out, x_attn_out = torch.chunk(x_mlp_attn, 2, dim=-1)
 
-        # Add residual w/ drop path & layer scale applied
-        y = self.drop_path(self.ls(x_attn_out + x_mlp_out))
+        if num_experts > 1:
+            x_attn_out = self._nested_combine(
+                attn_output=x_attn_out,
+                mlp_output=x_mlp_out,
+                residual=x,
+                expert_prob=expert_prob,
+                alpha=alpha,
+            )
+        else:
+            x_attn_out = self.drop_path(self.ls(x_attn_out + x_mlp_out))
         x = x + y
         return x
-
-

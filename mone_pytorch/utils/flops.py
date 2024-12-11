@@ -12,11 +12,13 @@ except ImportError as e:
 
 
 def profile_fvcore(model, input_size=(3, 224, 224), input_dtype=torch.float32, max_depth=4,
-                   batch_size=1, detailed=False, force_cpu=False):
+                   batch_size=1, detailed=False, force_cpu=False, other_inputs=None):
     if force_cpu:
         model = model.to('cpu')
     device, _ = next(model.parameters()).device, next(model.parameters()).dtype
     example_input = torch.zeros((batch_size,) + input_size, device=device, dtype=input_dtype)
+    if other_inputs is not None:
+        example_input = (example_input, *other_inputs)
     fca = FlopCountAnalysis(model, example_input)
     aca = ActivationCountAnalysis(model, example_input)
     if detailed:

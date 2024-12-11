@@ -1,4 +1,4 @@
-name: nested-vit-small
+name: vit-small
 embed_dim: 384
 depth: 12
 num_heads: 6
@@ -7,10 +7,8 @@ qkv_bias: true
 patch_size: 16
 img_size: 224
 num_classes: ${data.num_classes}
-
-# Additional model parameters
-num_routers: 1
-use_alpha: false
 mlp_type: mlp
 block_type: sequential
-shared_router: false
+num_routers: ${mone.num_experts}
+num_experts: ${mone.num_experts}
+router_bias: ${mone.router_bias}

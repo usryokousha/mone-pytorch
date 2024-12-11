@@ -11,7 +11,16 @@ from torch.nn.attention.flex_attention import (
     BlockMask,
 )
 from typing import Optional, Tuple, Callable, Union
-from .nested_linear import nested_linear_expand, nested_linear_contract
+from .nested_linear import (
+    nested_linear_expand,
+    nested_linear_contract,
+    _check_nested_linear,
+)
+
+attention_fn = {
+    "flash": F.scaled_dot_product_attention,
+    "flex": flex_attention,
+}
 
 
 # NATTEN attention mask with support for cls/register tokens
@@ -70,8 +79,6 @@ def generate_natten_ext(
     return natten_mask_mod
 
 
-
-
 @lru_cache
 def update_natten_mask(
     grid_size: Tuple[int, int], window_size: Tuple[int, int], n_cls: int
@@ -85,9 +92,7 @@ def update_natten_mask(
 
 @lru_cache
 def update_local_window_mask(window_size: int, n_cls: int) -> torch.Tensor:
-    return create_block_mask(
-        generate_local_window_mask(window_size, n_cls)
-    )
+    return create_block_mask(generate_local_window_mask(window_size, n_cls))
 
 
 class Attention(nn.Module):
@@ -120,12 +125,12 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: Optional[Union[torch.Tensor, BlockMask]] = None,
+        attn_mask: Optional[Union[torch.Tensor, BlockMask]] = None,
         expert_mask: Optional[torch.Tensor] = None,
         num_experts: int = 1,
     ) -> torch.Tensor:
         B, N, C = x.shape
-        if num_experts > 1:
+        if _check_nested_linear(expert_mask, num_experts):
             qkv = nested_linear_expand(
                 x, self.qkv.weight, expert_mask, self.qkv.bias, num_experts
             )
@@ -137,22 +142,27 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(dim=0)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        if self.attn_fn is F.scaled_dot_product_attention:
+        if isinstance(self.attn_fn, F.scaled_dot_product_attention):
             assert isinstance(
-                mask, torch.Tensor
+                attn_mask, torch.Tensor
             ), "mask must be a tensor for scaled_dot_product_attention"
             x = self.attn_fn(
-                q, k, v, attn_mask=mask, dropout_p=self.attn_drop, scale=self.scale
+                q, k, v, attn_mask=attn_mask, dropout_p=self.attn_drop, scale=self.scale
             )
-        elif self.attn_fn is flex_attention:
+        elif isinstance(self.attn_fn, flex_attention):
             assert isinstance(
-                mask, BlockMask
+                attn_mask, BlockMask
             ), "mask must be a BlockMask for flex_attention"
-            x = flex_attention(q, k, v, block_mask=mask, scale=self.scale)
+            x = flex_attention(q, k, v, block_mask=attn_mask, scale=self.scale)
             x = F.dropout(x, p=self.attn_drop, training=self.training)
         else:
             raise ValueError(f"Unsupported attention function: {self.attn_fn}")
-        x = self.proj(x)
+        if _check_nested_linear(expert_mask, num_experts):
+            x = nested_linear_contract(
+                x, self.proj.weight, expert_mask, self.proj.bias, num_experts
+            )
+        else:
+            x = self.proj(x)
         x = F.dropout(x, p=self.proj_drop, training=self.training)
         return x
 
@@ -162,12 +172,12 @@ def generate_local_window_mask(
     n_cls: int = 1,
 ) -> _mask_mod_signature:
     """Generates an attention mask for local window attention with fixed window sizes.
-    
+
     Args:
         tokens_per_window: Number of tokens in each window after dropout
         n_cls: Number of cls/register tokens prepended to the sequence
     """
-    
+
     def local_mask_mod(
         b: IntTensor,
         h: IntTensor,
@@ -177,23 +187,23 @@ def generate_local_window_mask(
         # Adjust indices to account for cls tokens
         q_idx_adj = q_idx - n_cls
         kv_idx_adj = kv_idx - n_cls
-        
+
         # Identify cls tokens (indices < 0 after adjustment)
         q_is_cls = q_idx_adj < 0
         kv_is_cls = kv_idx_adj < 0
-        
+
         # Calculate window indices for regular tokens
         q_window = torch.where(q_is_cls, -1, q_idx_adj // tokens_per_window)
         kv_window = torch.where(kv_is_cls, -1, kv_idx_adj // tokens_per_window)
-        
+
         # Local window mask: tokens can only attend within their window
         window_mask = (q_window == kv_window) & (~q_is_cls) & (~kv_is_cls)
-        
+
         # Allow cls tokens to attend to all tokens and be attended by all tokens
         cls_query_mask = q_is_cls
         cls_key_mask = kv_is_cls
-        
+
         final_mask = window_mask | cls_query_mask | cls_key_mask
         return final_mask
-    
+
     return local_mask_mod

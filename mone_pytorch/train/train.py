@@ -8,8 +8,11 @@ from mone_pytorch.utils.flops import profile_fvcore
 
 from mone_pytorch.data.dataloader import build_dataloaders
 from mone_pytorch.train.initialize import initialize_model
-from mone_pytorch.utils.optimizer import build_optimizer, scale_lr
+from mone_pytorch.utils.optimizer import build_optimizer
+from mone_pytorch.layers.routing import CapacityScheduler, compute_capacity_distribution
 from mone_pytorch.utils.augmentation import CutMixup
+
+from typing import Optional
 
 def train_one_epoch(
     fabric: Fabric,
@@ -21,6 +24,7 @@ def train_one_epoch(
     metrics: MetricCollection,
     cfg: DictConfig,
     epoch: int,
+    capacity_distribution: Optional[torch.Tensor] = None,
 ):
     model.train()
     cutmixup = CutMixup(
@@ -36,7 +40,7 @@ def train_one_epoch(
         ):
             # Apply mixup/cutmix transforms
             images, targets = cutmixup(images, targets)
-            outputs = model(images)
+            outputs = model(images, c=capacity_distribution.to(fabric.device))
 
             loss = torch.nn.functional.cross_entropy(
                 outputs, targets, label_smoothing=cfg.augmentation.label_smoothing
@@ -61,10 +65,14 @@ def train_one_epoch(
                     ema_model.update_parameters(model.module)
 
         # Only print when we complete a gradient accumulation step AND it's a 10th effective batch
-        if (batch_idx + 1) % cfg.training.gradient_accumulation == 0:  # Only on accumulation steps
+        if (
+            batch_idx + 1
+        ) % cfg.training.gradient_accumulation == 0:  # Only on accumulation steps
             effective_batch = batch_idx // cfg.training.gradient_accumulation
             if fabric.is_global_zero and effective_batch % 10 == 0:
-                total_effective_batches = len(train_loader) // cfg.training.gradient_accumulation
+                total_effective_batches = (
+                    len(train_loader) // cfg.training.gradient_accumulation
+                )
                 fabric.print(
                     f"Epoch: {epoch} | Effective Batch: {effective_batch}/{total_effective_batches} "
                     f"| Loss: {loss.item():.4f}"
@@ -81,7 +89,6 @@ def train_one_epoch(
                 metrics_dict["train/learning_rate"] = scheduler.get_last_lr()[0]
                 metrics_dict["train/loss"] = loss.detach()
 
-
                 fabric.log_dict(metrics_dict, step=global_step)
 
                 # Reset metrics after logging
@@ -93,14 +100,20 @@ def validate(
     model: torch.nn.Module,
     val_loader,
     metrics: MetricCollection,
+    cfg: DictConfig,
     epoch: int,
+    capacity_distribution: Optional[torch.Tensor] = None,
 ):
     """Run validation loop and log metrics."""
     model.eval()
-
+    if capacity_distribution is not None:
+        capacity_distribution = torch.tensor(
+            [0.0] * (cfg.mone.num_experts - 1) + [1.0], 
+            dtype=torch.float32,
+        )
     with torch.no_grad():
         for images, targets in val_loader:
-            outputs = model(images)
+            outputs = model(images, c=capacity_distribution.to(fabric.device))
             loss = torch.nn.functional.cross_entropy(outputs, targets)
 
             # Update validation metrics
@@ -161,12 +174,8 @@ def main(cfg: DictConfig):
     # Get dataloaders and augmentation
     train_loader, val_loader = build_dataloaders(cfg)
 
-    train_steps = len(train_loader) // (
-        fabric.world_size * cfg.training.gradient_accumulation
-    )
-    val_steps = len(val_loader) // (
-        fabric.world_size * cfg.training.gradient_accumulation
-    )
+    train_steps = len(train_loader) // cfg.training.gradient_accumulation
+    val_steps = len(val_loader)
     fabric.print(f"Effective training steps / epoch: {train_steps}")
     fabric.print(f"Effective validation steps / epoch: {val_steps}")
 
@@ -205,9 +214,23 @@ def main(cfg: DictConfig):
         prefix="train/",
     )
     val_metrics = train_metrics.clone(prefix="val/")
-
     train_metrics = train_metrics.to(fabric.device)
     val_metrics = val_metrics.to(fabric.device)
+
+    # Capacity scheduler
+    if cfg.mone is not None:
+        fabric.print("Using capacity scheduler for MoNE")
+        capacity_scheduler = CapacityScheduler(
+            patch_size=cfg.model.patch_size,
+            image_size=cfg.model.img_size,
+            max_epochs=cfg.training.epochs,
+            min_capacity=cfg.mone.min_capacity,
+            max_capacity=cfg.mone.max_capacity,
+            num_experts=cfg.mone.num_experts,
+            delta=cfg.mone.delta,
+            beta=cfg.mone.beta,
+            annealing_type=cfg.mone.annealing_type,
+        )
 
     # Handle checkpoint resuming
     start_epoch = 0
@@ -218,42 +241,80 @@ def main(cfg: DictConfig):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         train_metrics.load_state_dict(checkpoint["train_metrics_state_dict"])
         val_metrics.load_state_dict(checkpoint["val_metrics_state_dict"])
+        if capacity_scheduler is not None:
+            capacity_scheduler.load_state_dict(checkpoint["capacity_scheduler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
 
     # print settings
     fabric.print(f"Training for {cfg.training.epochs} epochs")
     fabric.print(f"Starting from epoch {start_epoch}")
-    fabric.print(
-        f"Effective batch size: {cfg.training.batch_size * fabric.world_size * cfg.training.gradient_accumulation}"
-    )
-    effective_lr = scale_lr(
-        cfg.optimizer.hparams.lr,
-        cfg.training.batch_size,
-        cfg.training.gradient_accumulation,
-        fabric.world_size,
-    )
-    fabric.print(f"Effective learning rate: {effective_lr}")
     fabric.print(f"Using {cfg.training.precision} precision")
     fabric.print(f"Using {cfg.training.devices} devices")
 
     if cfg.training.logging.flops:
-        import warnings
-        import logging
-        # Suppress fvcore logging
-        logging.getLogger('fvcore').setLevel(logging.ERROR)
-        # Suppress warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            _, fca_total, _, aca_total = profile_fvcore(
-                model,
-                input_size=(3, cfg.model.img_size, cfg.model.img_size),
-                input_dtype=torch.bfloat16,
-            )
-        fabric.print(f"FLOPs: {fca_total * 1e-9:.5f} GFLOPs")
-        fabric.print(f"Activation FLOPs: {aca_total * 1e-9:.5f} GFLOPs")
+        if fabric.is_global_zero:
+            import warnings
+            import logging
+
+            # Suppress fvcore logging
+            logging.getLogger("fvcore").setLevel(logging.ERROR)
+            if cfg.mone is not None:
+                capacity_distribution = torch.tensor(
+                    [0.0] * (cfg.mone.num_experts - 1) + [1.0], 
+                    dtype=torch.float32,
+                    device=fabric.device,
+                )
+                # Suppress warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    _, fca_total, _, aca_total = profile_fvcore(
+                        model,
+                    input_size=(3, cfg.model.img_size, cfg.model.img_size),
+                    input_dtype=torch.bfloat16,
+                )
+            fabric.print("Profiling FLOPs ...")
+            fabric.print(f"MoNE is {["enabled", "disabled"][cfg.mone is None]}")
+            fabric.print(f"FLOPs: {fca_total * 1e-9:.5f} GFLOPs")
+            fabric.print(f"Activation FLOPs: {aca_total * 1e-9:.5f} GFLOPs")
+
+            if cfg.mone is not None:
+                capacity_distribution = compute_capacity_distribution(
+                    e_c=cfg.mone.effective_capacity,
+                    E=cfg.mone.num_experts,
+                    delta=cfg.mone.delta,
+                    beta=cfg.mone.beta
+                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    _, fca_total, _, aca_total = profile_fvcore(
+                        model,
+                        input_size=(3, cfg.model.img_size, cfg.model.img_size),
+                        input_dtype=torch.bfloat16,
+                        other_inputs=(capacity_distribution.to(fabric.device),),
+                    )
+                fabric.print("Profiling FLOPs at 50% Effective Capacity ...")
+                fabric.print(f"FLOPs: {fca_total * 1e-9:.5f} GFLOPs")
+                fabric.print(f"Activation FLOPs: {aca_total * 1e-9:.5f} GFLOPs")
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
+        capacity_distribution = None
+        adjusted_patch_size = None
+        # Update capacity scheduler
+        if capacity_scheduler is not None:
+            if fabric.is_global_zero:
+                fabric.print("Using capacity scheduler for MoNE")
+                capacity_distribution, adjusted_patch_size = capacity_scheduler.update()
+            else:
+                capacity_distribution = torch.zeros(cfg.mone.num_experts)
+                adjusted_patch_size = torch.zeros(1)
+            capacity_distribution = fabric.broadcast(capacity_distribution)
+            adjusted_patch_size = fabric.broadcast(adjusted_patch_size)
+
+            model.module.set_input_size(
+                img_size=cfg.model.img_size,
+                patch_size=adjusted_patch_size.item(),
+            )
         train_one_epoch(
             fabric=fabric,
             model=model,
@@ -264,6 +325,7 @@ def main(cfg: DictConfig):
             metrics=train_metrics,  # Pass metrics to train_one_epoch
             cfg=cfg,
             epoch=epoch,
+            capacity_distribution=capacity_distribution,
         )
 
         # Validation
@@ -274,6 +336,7 @@ def main(cfg: DictConfig):
                 val_loader=val_loader,
                 metrics=val_metrics,
                 epoch=epoch,
+                capacity_distribution=capacity_distribution,
             )
 
         # Save checkpoint
