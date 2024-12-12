@@ -11,11 +11,13 @@ from typing import Tuple
 """Implementation of the routing algorithm for the MONE model."""
 
 
-class EPR(nn.Module):
-    def __init__(self, embedding_dim: int, num_experts: int, bias: bool = False):
-        super(EPR, self).__init__()
+class Router(nn.Module):
+    def __init__(self, dim: int, num_experts: int, bias: bool = False):
+        super().__init__()
+        self.dim = dim
+        self.bias = bias
         self.num_experts = num_experts
-        self.router_pred = nn.Linear(embedding_dim, num_experts, bias=bias)
+        self.router_pred = nn.Linear(dim, num_experts, bias=bias)
         self._init_weights()
 
     def _init_weights(self):
@@ -27,7 +29,7 @@ class EPR(nn.Module):
     @torch.amp.autocast(enabled=False, device_type="cuda")
     def _compute_router_probs(
         self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Compute the router probabilities for the input tokens.
         Keeps computation in float32 for numerical stability.
@@ -43,23 +45,48 @@ class EPR(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return probs
 
+    def _compute_routing_instructions(
+        self, router_probs: torch.Tensor, capacity: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Abstract method to compute routing instructions.
+        Must be implemented by child classes.
+        """
+        raise NotImplementedError
+
     def forward(
         self, x: torch.Tensor, c: torch.Tensor, jitter_noise: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, N, D = x.shape
-        E = self.num_experts
+        # Compute router predictions
+        r_probs = self._compute_router_probs(x, jitter_noise)
+        return self._compute_routing_instructions(r_probs, c)
+
+
+class EPR(Router):
+    def _compute_routing_instructions(
+        self, router_probs: torch.Tensor, capacity: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute expert assignments using the EPR algorithm.
+
+        Args:
+            router_probs: Tensor of shape (B, N, E) containing router probabilities
+            capacity: Tensor of shape (E,) containing capacity fractions for each expert
+
+        Returns:
+            Tuple[Tensor, Tensor]: Expert assignments and corresponding probabilities
+        """
+        B, N, E = router_probs.shape
         T = N
 
-        # Compute router predictions
-        r_probs = self._compute_router_probs(x, jitter_noise)  # (B, N, E)
-        r_modified = r_probs.permute(0, 2, 1).clone()  # (B, E, N)
+        r_modified = router_probs.permute(0, 2, 1).clone()  # (B, E, N)
 
         # Initialize assignments to the smallest model (expert = 0)
-        M = torch.zeros((B, N), dtype=torch.long, device=x.device)
+        M = torch.zeros((B, N), dtype=torch.long, device=router_probs.device)
 
         # Iterate from largest model (E-1) down to smallest (0)
         for j in reversed(range(E)):
-            kj = math.floor(c[j] * T)
+            kj = math.floor(capacity[j] * T)
             if kj > 0:
                 # Get top-k indices for expert j
                 _, indices = torch.topk(r_modified[:, j, :], k=kj, dim=-1)  # (B, kj)
@@ -69,17 +96,74 @@ class EPR(nn.Module):
                 M.scatter_(1, indices, assign_vals)
 
                 # Scatter -inf into r_modified for these chosen tokens across all experts
-                # indices shape: (B, kj)
-                # Expand indices to (B, E, kj) to null out for all experts
                 expanded_indices = indices.unsqueeze(1).expand(B, E, kj)  # (B, E, kj)
-                chosen_tokens = torch.full((B, E, kj), float("-inf"), device=x.device)
+                chosen_tokens = torch.full(
+                    (B, E, kj), float("-inf"), device=router_probs.device
+                )
                 r_modified.scatter_(2, expanded_indices, chosen_tokens)
 
         # Gather probabilities of the assigned experts
-        M_probs = r_probs.gather(2, M.unsqueeze(-1)).squeeze(-1)  # (B, N)
+        M_probs = router_probs.gather(2, M.unsqueeze(-1)).squeeze(-1)  # (B, N)
 
         return M, M_probs
 
+
+class ExpertsChooseRouter(Router):
+    """
+    PyTorch implementation of 'experts choose' routing strategy,
+    subclassing the given Router class. This strategy assigns tokens
+    by letting each expert pick its top tokens independently.
+
+    The `_compute_routing_instructions` method returns:
+    - dispatch_mask: [batch, num_tokens, num_experts, capacity]
+    - combine_array: [batch, num_tokens, num_experts, capacity]
+
+    Here, 'capacity' is the number of tokens that each expert selects.
+    """
+
+    def _compute_routing_instructions(
+        self, router_probs: torch.Tensor, capacity: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute routing instructions using "experts choose" routing.
+
+        Args:
+            router_probs (torch.Tensor): [B, T, E] router probabilities
+                                         B: batch
+                                         T: num_tokens
+                                         E: num_experts
+            capacity (torch.Tensor): scalar tensor indicating the top-k capacity.
+
+        Returns:
+            dispatch_mask (torch.Tensor): [B, T, E, C] binary mask indicating which
+                                          tokens are chosen by which experts.
+            combine_array (torch.Tensor): [B, T, E, C] probabilities scaled by dispatch_mask.
+        """
+        # Ensure capacity is an integer
+        if isinstance(capacity, torch.Tensor):
+            capacity = int(capacity.item())
+
+        B, T, E = router_probs.shape
+
+        # Transpose to [B, E, T] to easily pick top-k per expert
+        router_probs_t = router_probs.transpose(1, 2)  # [B, E, T]
+
+        # Select top capacity tokens for each expert
+        # expert_gate: [B, E, C], expert_index: [B, E, C]
+        expert_gate, expert_index = torch.topk(router_probs_t, k=capacity, dim=-1)
+
+        # Create a one-hot dispatch mask of shape [B, E, C, T]
+        dispatch_mask = F.one_hot(expert_index, num_classes=T).float()  # [B, E, C, T]
+
+        # Permute to [B, T, E, C] to match desired output shape
+        dispatch_mask = dispatch_mask.permute(0, 3, 1, 2).contiguous()  # [B, T, E, C]
+
+        # The combine array is the dispatch mask scaled by the selected probabilities
+        # expert_gate: [B, E, C]. We need to broadcast over T dimension
+        expert_gate_expanded = expert_gate.unsqueeze(1)  # [B, 1, E, C]
+        combine_array = dispatch_mask * expert_gate_expanded  # [B, T, E, C]
+
+        return dispatch_mask, combine_array
 
 class NestedCombine(nn.Module):
     """
@@ -253,13 +337,14 @@ class CapacityScheduler(nn.Module):
         self.delta = delta
         self.beta = beta
         self.annealing_type = annealing_type
-        
+
         # Register buffers for stateful variables
-        self.register_buffer('start_epoch', torch.tensor(0))
-        self.register_buffer('epoch', torch.tensor(0))
-        self.register_buffer('effective_capacity', torch.tensor(max_capacity))
-        self.register_buffer('capacity_distribution', 
-            torch.zeros(num_experts, dtype=torch.float32))
+        self.register_buffer("start_epoch", torch.tensor(0))
+        self.register_buffer("epoch", torch.tensor(0))
+        self.register_buffer("effective_capacity", torch.tensor(max_capacity))
+        self.register_buffer(
+            "capacity_distribution", torch.zeros(num_experts, dtype=torch.float32)
+        )
 
     def update(self) -> Tuple[torch.Tensor, int]:
         # Update the epoch
@@ -267,37 +352,45 @@ class CapacityScheduler(nn.Module):
 
         # Compute the effective capacity for the current step
         if self.annealing_type == "exponential":
-            self.effective_capacity = torch.tensor(_exponential_annealing(
-                int(self.epoch.item()),
-                int(self.start_epoch.item()),
-                self.max_epochs,
-                self.min_capacity,
-                self.max_capacity,
-            ))
+            self.effective_capacity = torch.tensor(
+                _exponential_annealing(
+                    int(self.epoch.item()),
+                    int(self.start_epoch.item()),
+                    self.max_epochs,
+                    self.min_capacity,
+                    self.max_capacity,
+                )
+            )
         elif self.annealing_type == "cosine":
-            self.effective_capacity = torch.tensor(_cosine_annealing(
-                int(self.epoch.item()),
-                int(self.start_epoch.item()),
-                self.max_epochs,
-                self.min_capacity,
-                self.max_capacity,
-            ))
+            self.effective_capacity = torch.tensor(
+                _cosine_annealing(
+                    int(self.epoch.item()),
+                    int(self.start_epoch.item()),
+                    self.max_epochs,
+                    self.min_capacity,
+                    self.max_capacity,
+                )
+            )
         elif self.annealing_type == "linear":
-            self.effective_capacity = torch.tensor(_linear_annealing(
-                int(self.epoch.item()),
-                int(self.start_epoch.item()),
-                self.max_epochs,
-                self.min_capacity,
-                self.max_capacity,
-            ))
+            self.effective_capacity = torch.tensor(
+                _linear_annealing(
+                    int(self.epoch.item()),
+                    int(self.start_epoch.item()),
+                    self.max_epochs,
+                    self.min_capacity,
+                    self.max_capacity,
+                )
+            )
 
         # Compute the capacity distribution based on new effective capacity
-        self.capacity_distribution = torch.tensor(compute_capacity_distribution(
-            self.num_experts, 
-            float(self.effective_capacity.item()), 
-            self.delta, 
-            self.beta
-        ))
+        self.capacity_distribution = torch.tensor(
+            compute_capacity_distribution(
+                self.num_experts,
+                float(self.effective_capacity.item()),
+                self.delta,
+                self.beta,
+            )
+        )
 
         return self.capacity_distribution, self.adjusted_patch_size
 
@@ -305,42 +398,46 @@ class CapacityScheduler(nn.Module):
         """Reset the scheduler state"""
         self.epoch.zero_()
         self.effective_capacity.fill_(self.max_capacity)
-        
+
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
         # Add any additional state that's not captured by buffers
-        state_dict.update({
-            'patch_size': self.patch_size,
-            'image_size': self.image_size,
-            'max_epochs': self.max_epochs,
-            'min_capacity': self.min_capacity,
-            'max_capacity': self.max_capacity,
-            'num_experts': self.num_experts,
-            'delta': self.delta,
-            'beta': self.beta,
-            'annealing_type': self.annealing_type,
-        })
+        state_dict.update(
+            {
+                "patch_size": self.patch_size,
+                "image_size": self.image_size,
+                "max_epochs": self.max_epochs,
+                "min_capacity": self.min_capacity,
+                "max_capacity": self.max_capacity,
+                "num_experts": self.num_experts,
+                "delta": self.delta,
+                "beta": self.beta,
+                "annealing_type": self.annealing_type,
+            }
+        )
         return state_dict
 
     def load_state_dict(self, state_dict, strict: bool = True):
         # Extract configuration parameters
-        self.patch_size = state_dict.pop('patch_size')
-        self.image_size = state_dict.pop('image_size')
-        self.max_epochs = state_dict.pop('max_epochs')
-        self.min_capacity = state_dict.pop('min_capacity')
-        self.max_capacity = state_dict.pop('max_capacity')
-        self.num_experts = state_dict.pop('num_experts')
-        self.delta = state_dict.pop('delta')
-        self.beta = state_dict.pop('beta')
-        self.annealing_type = state_dict.pop('annealing_type')
-        
+        self.patch_size = state_dict.pop("patch_size")
+        self.image_size = state_dict.pop("image_size")
+        self.max_epochs = state_dict.pop("max_epochs")
+        self.min_capacity = state_dict.pop("min_capacity")
+        self.max_capacity = state_dict.pop("max_capacity")
+        self.num_experts = state_dict.pop("num_experts")
+        self.delta = state_dict.pop("delta")
+        self.beta = state_dict.pop("beta")
+        self.annealing_type = state_dict.pop("annealing_type")
+
         # Load the remaining state (buffers)
         super().load_state_dict(state_dict, strict=strict)
 
     @property
     def adjusted_patch_size(self) -> torch.Tensor:
         # Calculate patch size based on effective capacity and ensure it's the next even number
-        patch_size = torch.maximum(torch.tensor(1), (self.patch_size * self.effective_capacity).int())
+        patch_size = torch.maximum(
+            torch.tensor(1), (self.patch_size * self.effective_capacity).int()
+        )
         return patch_size + (patch_size % 2)
 
 
