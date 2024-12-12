@@ -153,17 +153,17 @@ class ExpertsChooseRouter(Router):
         expert_gate, expert_index = torch.topk(router_probs_t, k=capacity, dim=-1)
 
         # Create a one-hot dispatch mask of shape [B, E, C, T]
-        dispatch_mask = F.one_hot(expert_index, num_classes=T).float()  # [B, E, C, T]
+        dispatch_mask = F.one_hot(expert_index, num_classes=T).float()
 
         # Permute to [B, T, E, C] to match desired output shape
-        dispatch_mask = dispatch_mask.permute(0, 3, 1, 2).contiguous()  # [B, T, E, C]
+        dispatch_mask = dispatch_mask.permute(0, 3, 1, 2).contiguous()
 
         # The combine array is the dispatch mask scaled by the selected probabilities
-        # expert_gate: [B, E, C]. We need to broadcast over T dimension
         expert_gate_expanded = expert_gate.unsqueeze(1)  # [B, 1, E, C]
         combine_array = dispatch_mask * expert_gate_expanded  # [B, T, E, C]
 
         return dispatch_mask, combine_array
+
 
 class NestedCombine(nn.Module):
     """
