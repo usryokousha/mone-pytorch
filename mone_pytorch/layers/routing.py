@@ -27,7 +27,7 @@ class Router(nn.Module):
             nn.init.zeros_(self.router_pred.bias)
 
     @torch.amp.autocast(enabled=False, device_type="cuda")
-    def _compute_router_probs(
+    def compute_router_probs(
         self, input_tokens: torch.Tensor, jitter_noise: float = 0.0
     ) -> torch.Tensor:
         """
@@ -45,16 +45,7 @@ class Router(nn.Module):
         probs = F.softmax(logits, dim=-1)
         return probs
 
-    def _compute_routing_instructions(
-        self, router_probs: torch.Tensor, capacity: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Abstract method to compute routing instructions.
-        Must be implemented by child classes.
-        """
-        raise NotImplementedError
-    
-    def _compute_sparse_routing_instructions(
+    def compute_routing_instructions(
         self, router_probs: torch.Tensor, capacity: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -67,12 +58,12 @@ class Router(nn.Module):
         self, x: torch.Tensor, c: torch.Tensor, jitter_noise: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Compute router predictions
-        r_probs = self._compute_router_probs(x, jitter_noise)
-        return self._compute_routing_instructions(r_probs, c)
+        r_probs = self.compute_router_probs(x, jitter_noise)
+        return self.compute_routing_instructions(r_probs, c)
 
 
 class EPR(Router):
-    def _compute_routing_instructions(
+    def compute_routing_instructions(
         self, router_probs: torch.Tensor, capacity: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -130,7 +121,7 @@ class ExpertsChooseRouter(Router):
     Here, 'capacity' is the number of tokens that each expert selects.
     """
 
-    def _compute_routing_instructions(
+    def compute_routing_instructions(
         self, router_probs: torch.Tensor, capacity: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -154,12 +145,7 @@ class ExpertsChooseRouter(Router):
 
         B, T, E = router_probs.shape
 
-        # Transpose to [B, E, T] to easily pick top-k per expert
-        router_probs_t = router_probs.transpose(1, 2)  # [B, E, T]
-
-        # Select top capacity tokens for each expert
-        # expert_gate: [B, E, C], expert_index: [B, E, C]
-        expert_gate, expert_index = torch.topk(router_probs_t, k=capacity, dim=-1)
+        expert_index, expert_gate = self.compute_routing_indices(router_probs, capacity)
 
         # Create a one-hot dispatch mask of shape [B, E, C, T]
         dispatch_mask = F.one_hot(expert_index, num_classes=T).float()
@@ -172,6 +158,13 @@ class ExpertsChooseRouter(Router):
         combine_array = dispatch_mask * expert_gate_expanded  # [B, T, E, C]
 
         return dispatch_mask, combine_array
+    
+    def compute_routing_indices(self, router_probs: torch.Tensor, capacity: int) -> torch.Tensor:
+        """
+        Compute expert gates using the router probabilities.
+        """
+        # Output top capacity indices and gates for each expert [B, E, C]
+        return torch.topk(router_probs.transpose(1, 2), k=capacity, dim=-1)
 
 
 class NestedCombine(nn.Module):

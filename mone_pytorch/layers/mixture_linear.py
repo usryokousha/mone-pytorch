@@ -5,7 +5,7 @@ from mone_pytorch.layers.routing import Router
 
 from typing import Union, Dict
 
-
+@torch.compile
 class MixtureLinear(nn.Linear):
     def __init__(
         self,
@@ -119,8 +119,9 @@ if __name__ == "__main__":
 
     expert_capacity = 100
     x = torch.randn(256, 100, 768).cuda()
-    router = ExpertsChooseRouter(dim=768, num_experts=4, bias=True).cuda()
+    router = ExpertsChooseRouter(dim=768, num_experts=16, bias=True).cuda()
     mixture_linear = MixtureLinear(768, 768, router=router, return_metrics=True).cuda()
+    print(mixture_linear(x, expert_capacity=expert_capacity).shape)
 
     # test sparse performance
     # get peak memory usage 
