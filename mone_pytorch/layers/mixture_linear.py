@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from mone_pytorch.layers.routing import Router
 
 from typing import Union, Dict
 
-@torch.compile
+
 class MixtureLinear(nn.Linear):
     def __init__(
         self,
@@ -53,7 +54,7 @@ class MixtureLinear(nn.Linear):
         )
         # apply the linear transformation
         expert_outputs = torch.einsum(
-            "b e t f, e p f -> b e t p",
+            "b e t f, e p f -> b t e p",
             x_split,
             self.weight.reshape(
                 self.num_experts,
@@ -63,7 +64,7 @@ class MixtureLinear(nn.Linear):
         )
         # combine the expert outputs
         combined_outputs = torch.einsum(
-            "b e t p, b t e -> b t p",
+            "b t e p, b t e -> b t p",
             expert_outputs,
             router_probs,
         )
@@ -71,44 +72,38 @@ class MixtureLinear(nn.Linear):
 
     def forward_sparse(self, x: torch.Tensor, expert_capacity: int) -> torch.Tensor:
         batch_size, num_tokens, _ = x.shape
-
-        # get distribution of tokens across experts
         dispatch_mask, combine_array = self.router(x, c=expert_capacity)
 
         # Reshape x to split features across experts
         # shape: [batch, capacity, num_experts, features_per_expert]
         x_split = x.reshape(batch_size, num_tokens, self.num_experts, -1)
 
-        # shape: [batch, expert_capacity, num_experts, features_per_expert]
-        x_split = torch.einsum(
-            "b t e f, b t e c -> b e c f",
-            x_split,
-            dispatch_mask,
-        )
-
         # apply the linear transformation
         expert_outputs = torch.einsum(
-            "b e c f, e p f -> b e c p",
+            "b t e f, b t e c, e p f -> b e c p",
             x_split,
+            dispatch_mask,
             self.weight.reshape(
                 self.num_experts,
                 self.out_features,
                 self.in_features // self.num_experts,
             ),
         )
-        if self.bias is not None:
-            expert_outputs += self.bias.reshape(1, 1, self.out_features)
 
-            # shape: [batch, num_tokens, out_features]
+        if self.bias is not None:
+            expert_outputs = expert_outputs + self.bias.reshape(1, 1, -1)
+
+        # shape: [batch, num_tokens, out_features]
         combined_outputs = torch.einsum(
-            "b e c p, b t e c -> b t p ...",
+            "b e c p, b t e c -> b t p",
             expert_outputs,
             combine_array,
         )
+
         if self.return_metrics:
             return combined_outputs, self._get_metrics(dispatch_mask, combine_array)
         return combined_outputs
-    
+
     def forward(
         self, x: torch.Tensor, expert_capacity: int
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -122,22 +117,44 @@ class MixtureLinear(nn.Linear):
 if __name__ == "__main__":
     from mone_pytorch.layers.routing import ExpertsChooseRouter
 
-    expert_capacity = 80
-    x = torch.randn(32, 100, 128)
-    router = ExpertsChooseRouter(dim=128, num_experts=8, bias=True)
-    mixture_linear = MixtureLinear(128, 128, router=router, return_metrics=True)
-    output, metrics = mixture_linear(x, expert_capacity=expert_capacity)
-    print(output.shape)
-    print(metrics)
+    expert_capacity = 100
+    x = torch.randn(256, 100, 768).cuda()
+    router = ExpertsChooseRouter(dim=768, num_experts=4, bias=True).cuda()
+    mixture_linear = MixtureLinear(768, 768, router=router, return_metrics=True).cuda()
 
-    # profile latency on gpu
+    # test sparse performance
+    # get peak memory usage 
     import time
-
+    import torch
+    start_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
     times = []
-    for i in range(100):
-        start = time.time()
-        mixture_linear(x, expert_capacity=expert_capacity)
+    for i in range(10):
+        output_sparse = mixture_linear.forward_sparse(x, expert_capacity=expert_capacity)
         torch.cuda.synchronize()
-        end = time.time()
-        times.append(end - start)
-    print(f"Time taken: {sum(times)/100:.6f} seconds")
+        times.append(time.time() - start_time)
+    print(f"Time taken: {sum(times) / len(times)} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
+
+    # test dense performance
+    torch.cuda.reset_peak_memory_stats()
+    start_time = time.time()
+    times = []
+    for i in range(10):
+        output_dense = mixture_linear.forward_full(x)
+        torch.cuda.synchronize()
+        times.append(time.time() - start_time)
+    print(f"Time taken: {sum(times) / len(times)} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
+
+    # compare regular linear
+    linear = nn.Linear(768, 768, bias=True).cuda()
+    torch.cuda.reset_peak_memory_stats()
+    start_time = time.time()
+    times = []
+    for i in range(10):
+        output_linear = linear(x)
+        torch.cuda.synchronize()
+        times.append(time.time() - start_time)
+    print(f"Time taken: {sum(times) / len(times)} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")

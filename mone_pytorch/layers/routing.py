@@ -46,7 +46,16 @@ class Router(nn.Module):
         return probs
 
     def _compute_routing_instructions(
-        self, router_probs: torch.Tensor, capacity: torch.Tensor
+        self, router_probs: torch.Tensor, capacity: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Abstract method to compute routing instructions.
+        Must be implemented by child classes.
+        """
+        raise NotImplementedError
+    
+    def _compute_sparse_routing_instructions(
+        self, router_probs: torch.Tensor, capacity: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Abstract method to compute routing instructions.
@@ -122,7 +131,7 @@ class ExpertsChooseRouter(Router):
     """
 
     def _compute_routing_instructions(
-        self, router_probs: torch.Tensor, capacity: torch.Tensor
+        self, router_probs: torch.Tensor, capacity: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute routing instructions using "experts choose" routing.

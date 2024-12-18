@@ -113,8 +113,8 @@ def nested_linear_contract(
         else:
             b_m = None
 
-        # Avoid explicit padding
-        x[valid_mask, :D_m] = F.linear(x[valid_mask], w_m, b_m)
+        # Avoid explicit padding while ensuring padding is zero
+        x[valid_mask, :] = F.pad(F.linear(x[valid_mask], w_m, b_m), (0, out_dim - D_m))
 
     return x.reshape(input_shape[:-1] + (out_dim,))
 
@@ -204,12 +204,14 @@ if __name__ == "__main__":
     import os
 
     os.environ["TORCH_CUDNN_V9_API_ENABLED"] = "1"
-    x = torch.randn(256, 768, 768, dtype=torch.float32).cuda()
+    x = torch.randn(256, 100, 768, dtype=torch.float32).cuda()
     w = torch.randn(768, 768, dtype=torch.float32).cuda()
-    expert_mask = torch.randint(0, 4, (256, 768)).cuda()
+    expert_mask = torch.zeros(256, 100, dtype=torch.int64).cuda()
+    expert_mask[:, :] = 3
+    
     # let's compare latency
     import time
-
+    torch.cuda.reset_peak_memory_stats()
     dense_times = []
     for _ in range(20):
         start_time = time.time()
@@ -218,8 +220,10 @@ if __name__ == "__main__":
         end_time = time.time()
         dense_times.append(end_time - start_time)
     print(f"Dense average time: {sum(dense_times)/20:.6f} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
     # Average over 10 executions for dense
+    torch.cuda.reset_peak_memory_stats()
     dense_times = []
     for _ in range(20):
         start_time = time.time()
@@ -228,7 +232,9 @@ if __name__ == "__main__":
         end_time = time.time()
         dense_times.append(end_time - start_time)
     print(f"Dense expand average time: {sum(dense_times)/20:.6f} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
+    torch.cuda.reset_peak_memory_stats()
     dense_times = []
     for _ in range(20):
         start_time = time.time()
@@ -237,7 +243,9 @@ if __name__ == "__main__":
         end_time = time.time()
         dense_times.append(end_time - start_time)
     print(f"Dense contract average time: {sum(dense_times)/20:.6f} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
+    torch.cuda.reset_peak_memory_stats()
     nested_mlp_times = []
     for _ in range(20):
         start_time = time.time()
@@ -246,6 +254,7 @@ if __name__ == "__main__":
         end_time = time.time()
         nested_mlp_times.append(end_time - start_time)
     print(f"Nested MLP average time: {sum(nested_mlp_times)/20:.6f} seconds")
+    print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
     # compare nested mlp vs expand + contract mlp
     combination_times = []
