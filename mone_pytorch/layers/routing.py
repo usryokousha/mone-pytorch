@@ -17,14 +17,14 @@ class Router(nn.Module):
         self.dim = dim
         self.bias = bias
         self.num_experts = num_experts
-        self.router_pred = nn.Linear(dim, num_experts, bias=bias)
+        self.router_weights = nn.Linear(dim, num_experts, bias=bias)
         self._init_weights()
 
     def _init_weights(self):
         # uniform distribution for the router weights
-        nn.init.uniform_(self.router_pred.weight, a=-2e-2, b=2e-2)
-        if self.router_pred.bias is not None:
-            nn.init.zeros_(self.router_pred.bias)
+        nn.init.uniform_(self.router_weights.weight, a=-2e-2, b=2e-2)
+        if self.router_weights.bias is not None:
+            nn.init.zeros_(self.router_weights.bias)
 
     @torch.amp.autocast(enabled=False, device_type="cuda")
     def compute_router_probs(
@@ -34,7 +34,7 @@ class Router(nn.Module):
         Compute the router probabilities for the input tokens.
         Keeps computation in float32 for numerical stability.
         """
-        logits = self.router_pred(input_tokens)
+        logits = self.router_weights(input_tokens)
         if jitter_noise > 0.0:
             noise = (
                 torch.randn_like(logits, dtype=logits.dtype, device=logits.device)
@@ -108,7 +108,7 @@ class EPR(Router):
         return M, M_probs
 
 
-class ExpertsChooseRouter(Router):
+class ExpertsChooseMaskedRouter(Router):
     """
     PyTorch implementation of 'experts choose' routing strategy,
     subclassing the given Router class. This strategy assigns tokens
@@ -145,26 +145,60 @@ class ExpertsChooseRouter(Router):
 
         B, T, E = router_probs.shape
 
-        expert_index, expert_gate = self.compute_routing_indices(router_probs, capacity)
+        # transpose router_probs to [B, E, T]
+        router_probs = router_probs.permute(0, 2, 1)
+
+        expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=-1)
 
         # Create a one-hot dispatch mask of shape [B, E, C, T]
-        dispatch_mask = F.one_hot(expert_index, num_classes=T).float()
+        dispatch_mask = F.one_hot(expert_indices, num_classes=T).float()
 
         # Permute to [B, T, E, C] to match desired output shape
         dispatch_mask = dispatch_mask.permute(0, 3, 1, 2).contiguous()
 
         # The combine array is the dispatch mask scaled by the selected probabilities
-        expert_gate_expanded = expert_gate.unsqueeze(1)  # [B, 1, E, C]
-        combine_array = dispatch_mask * expert_gate_expanded  # [B, T, E, C]
+        combine_array = torch.einsum("...ec,...tec->...tec", expert_gate, dispatch_mask)
 
         return dispatch_mask, combine_array
-    
-    def compute_routing_indices(self, router_probs: torch.Tensor, capacity: int) -> torch.Tensor:
+
+
+class ExpertsChooseRouter(Router):
+    """
+    PyTorch implementation of 'experts choose' routing strategy,
+    subclassing the given Router class. This strategy assigns tokens
+    by letting each expert pick its top tokens independently.
+
+    The `_compute_routing_instructions` method returns:
+    - expert_indices: [batch, capacity, num_experts]
+    - expert_gate: [batch, capacity, num_experts]
+
+    Here, 'capacity' is the number of tokens that each expert selects.
+    """
+
+    def compute_routing_instructions(
+        self, router_probs: torch.Tensor, capacity: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute expert gates using the router probabilities.
+        Compute routing instructions using "experts choose" routing.
+
+        Args:
+            router_probs (torch.Tensor): [B, T, E] router probabilities
+                                         B: batch
+                                         T: num_tokens
+                                         E: num_experts
+            capacity (torch.Tensor): scalar tensor indicating the top-k capacity.
+
+        Returns:
+            expert_indices (torch.Tensor): [B, E, C] indices of the chosen experts.
+            expert_gate (torch.Tensor): [B, E, C] probabilities of the chosen experts.
         """
-        # Output top capacity indices and gates for each expert [B, E, C]
-        return torch.topk(router_probs.transpose(1, 2), k=capacity, dim=-1)
+        # Ensure capacity is an integer
+        if isinstance(capacity, torch.Tensor):
+            capacity = int(capacity.item())
+
+        expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=1)
+
+        return expert_gate.permute(0, 2, 1), expert_indices.permute(0, 2, 1), 
 
 
 class NestedCombine(nn.Module):
