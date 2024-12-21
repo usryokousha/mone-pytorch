@@ -63,6 +63,9 @@ def nested_linear_expand(
     input_shape = x.shape
     batch_seq = x.shape[:-1].numel()
 
+    if torch.all(expert_mask == num_experts - 1):
+        return F.linear(x, w, b)
+
     # Reshape input and pad to output dimension
     x = x.reshape(batch_seq, in_dim)
     x = F.pad(x, (0, out_dim - in_dim))
@@ -70,6 +73,8 @@ def nested_linear_expand(
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (expert_mask == m).view(batch_seq)
+
+        # skip if no valid mask
         if not valid_mask.any():
             continue
 
@@ -98,9 +103,14 @@ def nested_linear_contract(
 
     # Initialize output tensor with same dtype as input
     x = x.reshape(batch_seq, in_dim)
+    x = F.pad(x, (0, out_dim - in_dim))
     for m in range(num_experts):
         # get the valid mask for the m-th expert
         valid_mask = (expert_mask == m).view(batch_seq)
+
+        # skip if no valid mask
+        if not valid_mask.any():
+            continue
 
         D_m = out_dim >> (num_experts - m - 1)
 
@@ -114,7 +124,8 @@ def nested_linear_contract(
             b_m = None
 
         # Avoid explicit padding while ensuring padding is zero
-        x[valid_mask, :] = F.pad(F.linear(x[valid_mask], w_m, b_m), (0, out_dim - D_m))
+        x[valid_mask, :D_m] = F.linear(x[valid_mask], w_m, b_m)
+        x[valid_mask, D_m:] = 0
 
     return x.reshape(input_shape[:-1] + (out_dim,))
 
@@ -141,6 +152,11 @@ def nested_mlp(
     x = x.reshape(batch_seq, in_dim)
     for m in range(num_experts):
         valid_mask = (expert_mask == m).view(batch_seq)
+
+        # skip if no valid mask
+        if not valid_mask.any():
+            continue
+
         D_m_in = in_dim >> (num_experts - m - 1)
         D_m_out = out_dim >> (num_experts - m - 1)
 
@@ -156,6 +172,7 @@ def nested_mlp(
             b_m = None
         y_m = F.linear(x_m, w_m, b_m)
         x[valid_mask, :D_m_out] = F.dropout(y_m, drop_rate, training)
+        x[valid_mask, D_m_out:] = 0
 
     return x.reshape(input_shape[:-1] + (out_dim,))
 
@@ -179,6 +196,10 @@ def nested_swiglu_mlp(
     for m in range(num_experts):
         valid_mask = (expert_mask == m).view(batch_seq)
 
+        # skip if no valid mask
+        if not valid_mask.any():
+            continue
+
         D_m_in = in_dim >> (num_experts - m - 1)
         D_m_out = out_dim >> (num_experts - m - 1)
 
@@ -196,6 +217,7 @@ def nested_swiglu_mlp(
             b_m = None
         y = F.linear(x_m, w_m, b_m)
         x[valid_mask, :D_m_out] = y
+        x[valid_mask, D_m_out:] = 0
 
     return x.reshape(input_shape[:-1] + (out_dim,))
 
@@ -207,58 +229,58 @@ if __name__ == "__main__":
     x = torch.randn(256, 100, 768, dtype=torch.float32).cuda()
     w = torch.randn(768, 768, dtype=torch.float32).cuda()
     expert_mask = torch.zeros(256, 100, dtype=torch.int64).cuda()
-    expert_mask[:, :] = 3
+    expert_mask[:, :] = 2
     
     # let's compare latency
     import time
     torch.cuda.reset_peak_memory_stats()
     dense_times = []
-    for _ in range(20):
+    for _ in range(100):
         start_time = time.time()
         F.linear(x, w)
         torch.cuda.synchronize()
         end_time = time.time()
         dense_times.append(end_time - start_time)
-    print(f"Dense average time: {sum(dense_times)/20:.6f} seconds")
+    print(f"Dense average time: {sum(dense_times)/100 * 1000:.4f} ms")
     print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
     # Average over 10 executions for dense
     torch.cuda.reset_peak_memory_stats()
     dense_times = []
-    for _ in range(20):
+    for _ in range(100):
         start_time = time.time()
         nested_linear_expand(x, w, expert_mask)
         torch.cuda.synchronize()
         end_time = time.time()
         dense_times.append(end_time - start_time)
-    print(f"Dense expand average time: {sum(dense_times)/20:.6f} seconds")
+    print(f"Dense expand average time: {sum(dense_times)/100 * 1000:.4f} ms")
     print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
     torch.cuda.reset_peak_memory_stats()
     dense_times = []
-    for _ in range(20):
+    for _ in range(100):
         start_time = time.time()
         nested_linear_contract(x, w, expert_mask)
         torch.cuda.synchronize()
         end_time = time.time()
         dense_times.append(end_time - start_time)
-    print(f"Dense contract average time: {sum(dense_times)/20:.6f} seconds")
+    print(f"Dense contract average time: {sum(dense_times)/100 * 1000:.4f} ms")
     print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
     torch.cuda.reset_peak_memory_stats()
     nested_mlp_times = []
-    for _ in range(20):
+    for _ in range(100):
         start_time = time.time()
         nested_mlp(x, w, w, expert_mask)
         torch.cuda.synchronize()
         end_time = time.time()
         nested_mlp_times.append(end_time - start_time)
-    print(f"Nested MLP average time: {sum(nested_mlp_times)/20:.6f} seconds")
+    print(f"Nested MLP average time: {sum(nested_mlp_times)/100 * 1000:.4f} ms")
     print(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 ** 3} GB")
 
     # compare nested mlp vs expand + contract mlp
     combination_times = []
-    for _ in range(20):
+    for _ in range(100):
         start_time = time.time()
         out = nested_linear_expand(x, w, expert_mask)
         out = F.gelu(out)
@@ -267,4 +289,4 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         end_time = time.time()
         combination_times.append(end_time - start_time)
-    print(f"Combination average time: {sum(combination_times)/20:.6f} seconds")
+    print(f"Combination average time: {sum(combination_times)/100 * 1000:.4f} ms")

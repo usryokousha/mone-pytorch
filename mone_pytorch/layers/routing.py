@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from scipy.optimize import minimize
 
-from typing import Tuple
+from typing import Tuple, Optional
 
 """Implementation of the routing algorithm for the MONE model."""
 
@@ -198,7 +198,105 @@ class ExpertsChooseRouter(Router):
 
         expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=1)
 
-        return expert_gate.permute(0, 2, 1), expert_indices.permute(0, 2, 1), 
+        return (
+            expert_gate.permute(0, 2, 1),
+            expert_indices.permute(0, 2, 1),
+        )
+
+
+def normalize(x: torch.Tensor, axis: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize tensor along dimension to unit norm."""
+    m = torch.rsqrt(torch.square(x).sum(axis=axis, keepdim=True) + eps)
+    return x * m
+
+
+class SoftMergingRouter(nn.Module):
+    """Soft router merging tokens as inputs/outputs of the experts.
+
+    Implementation of the routing algorithm from:
+    "From Sparse to Soft Mixture of Experts" (https://arxiv.org/abs/2308.00951)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        num_slots: Optional[int] = None,
+        capacity_factor: float = 1.0,
+        noise_std: float = 0.0,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_slots = num_slots
+        self.capacity_factor = capacity_factor
+        self.noise_std = noise_std
+        self.dtype = dtype or torch.float32
+        self.mu = nn.Parameter(torch.zeros(dim, self.num_experts, self.num_slots, dtype=self.dtype))
+        self.scale = nn.Parameter(torch.ones(1, dtype=self.dtype))
+        self._init_weights()
+
+    def _init_weights(self):
+        std = math.sqrt(1.0 / self.dim)
+        nn.init.normal_(self.mu, std=std)
+
+    def forward(
+        self, inputs: torch.Tensor, jitter_noise: float = 0.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            inputs: Tensor of shape (B, T, D) where:
+                B = batch size
+                T = number of tokens
+                D = dimension of input features
+            jitter_noise: If > 0, add noise to the logits
+
+        Returns:
+            Tuple of:
+                dispatch_weights: Tensor of shape (B, T, E, C)
+                combine_weights: Tensor of shape (B, T, E, C)
+        """
+        # Normalize inputs to have unit norm
+        inputs = inputs.to(self.dtype)
+        inputs = normalize(inputs, axis=-1)
+
+        # Normalize mu to have unit norm
+        mu = normalize(self.mu, axis=0)
+
+        # Determine number of slots if not specified
+        if self.num_slots is None:
+            _, num_tokens, _ = inputs.shape
+            self.num_slots = round(num_tokens * self.capacity_factor / self.num_experts)
+
+        # Scale inputs/mu before computing logits
+        if inputs.numel() < mu.numel():
+            inputs = inputs * self.scale
+        else:
+            mu = mu * self.scale
+
+        # Compute router logits
+        logits = torch.einsum("gmd,dnp->gmnp", inputs, mu)
+
+        # Add noise during training if specified
+        if jitter_noise > 0:
+            noise = torch.randn_like(logits) * jitter_noise
+            logits = logits + noise
+
+        # Compute dispatch and combine weights
+        dispatch_weights = F.softmax(logits, dim=1)
+        combine_weights = F.softmax(logits, dim=(2, 3))
+
+        return dispatch_weights, combine_weights
+
+    def dispatch(
+        self, inputs: torch.Tensor, dispatch_weights: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.einsum("btec,bt...->bec...", dispatch_weights, inputs)
+
+    def combine(
+        self, outputs: torch.Tensor, combine_weights: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.einsum("btec,bec...->bt...", combine_weights, outputs)
 
 
 class NestedCombine(nn.Module):
