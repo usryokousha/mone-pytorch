@@ -11,6 +11,14 @@ from typing import Tuple, Optional
 """Implementation of the routing algorithm for the MONE model."""
 
 
+def capacity(
+    num_experts: int,
+    num_tokens: int,
+    capacity_factor: float = 2.0,
+) -> int:
+    return int(num_tokens * capacity_factor / num_experts)
+
+
 class Router(nn.Module):
     def __init__(self, dim: int, num_experts: int, bias: bool = False):
         super().__init__()
@@ -62,7 +70,7 @@ class Router(nn.Module):
         return self.compute_routing_instructions(r_probs, c)
 
 
-class EPR(Router):
+class ExpertPreferredRouter(Router):
     def compute_routing_instructions(
         self, router_probs: torch.Tensor, capacity: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -148,6 +156,10 @@ class ExpertsChooseMaskedRouter(Router):
         # transpose router_probs to [B, E, T]
         router_probs = router_probs.permute(0, 2, 1)
 
+        if capacity == T:
+            # If full capacity we don't need to dispatch experts [B, T, E, C]
+            return None, router_probs.unsqueeze(-1)
+
         expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=-1)
 
         # Create a one-hot dispatch mask of shape [B, E, C, T]
@@ -223,16 +235,14 @@ class SoftMergingRouter(nn.Module):
         num_experts: int,
         num_slots: Optional[int] = None,
         capacity_factor: float = 1.0,
-        noise_std: float = 0.0,
-        dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
         self.num_experts = num_experts
         self.num_slots = num_slots
         self.capacity_factor = capacity_factor
-        self.noise_std = noise_std
-        self.dtype = dtype or torch.float32
-        self.mu = nn.Parameter(torch.zeros(dim, self.num_experts, self.num_slots, dtype=self.dtype))
+        self.mu = nn.Parameter(
+            torch.zeros(dim, self.num_experts, self.num_slots, dtype=self.dtype)
+        )
         self.scale = nn.Parameter(torch.ones(1, dtype=self.dtype))
         self._init_weights()
 
@@ -256,77 +266,46 @@ class SoftMergingRouter(nn.Module):
                 dispatch_weights: Tensor of shape (B, T, E, C)
                 combine_weights: Tensor of shape (B, T, E, C)
         """
-        # Normalize inputs to have unit norm
-        inputs = inputs.to(self.dtype)
-        inputs = normalize(inputs, axis=-1)
+        with torch.amp.autocast(
+            device_type="cuda", enabled=False, device=inputs.device
+        ):
+            # Normalize inputs to have unit norm
+            inputs = normalize(inputs, axis=-1)
 
-        # Normalize mu to have unit norm
-        mu = normalize(self.mu, axis=0)
+            # Normalize mu to have unit norm
+            mu = normalize(self.mu, axis=0)
 
-        # Determine number of slots if not specified
-        if self.num_slots is None:
-            _, num_tokens, _ = inputs.shape
-            self.num_slots = round(num_tokens * self.capacity_factor / self.num_experts)
+            # Determine number of slots if not specified
+            if self.num_slots is None:
+                _, num_tokens, _ = inputs.shape
+                self.num_slots = round(
+                    num_tokens * self.capacity_factor / self.num_experts
+                )
 
-        # Scale inputs/mu before computing logits
-        if inputs.numel() < mu.numel():
-            inputs = inputs * self.scale
-        else:
-            mu = mu * self.scale
+            # Scale inputs/mu before computing logits
+            if inputs.numel() < mu.numel():
+                inputs = inputs * self.scale
+            else:
+                mu = mu * self.scale
 
-        # Compute router logits
-        logits = torch.einsum("gmd,dnp->gmnp", inputs, mu)
+            # Compute router logits
+            logits = torch.einsum("gmd,dnp->gmnp", inputs, mu)
 
-        # Add noise during training if specified
-        if jitter_noise > 0:
-            noise = torch.randn_like(logits) * jitter_noise
-            logits = logits + noise
+            # Add noise during training if specified
+            if jitter_noise > 0:
+                noise = torch.randn_like(logits, dtype=logits.dtype) * jitter_noise
+                logits = logits + noise
 
-        # Compute dispatch and combine weights
-        dispatch_weights = F.softmax(logits, dim=1)
-        combine_weights = F.softmax(logits, dim=(2, 3))
+            # Compute dispatch and combine weights
+            dispatch_weights = F.softmax(logits, dim=1)
+            combine_weights = F.softmax(logits, dim=(2, 3))
 
         return dispatch_weights, combine_weights
 
-    def dispatch(
-        self, inputs: torch.Tensor, dispatch_weights: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.einsum("btec,bt...->bec...", dispatch_weights, inputs)
 
-    def combine(
-        self, outputs: torch.Tensor, combine_weights: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.einsum("btec,bec...->bt...", combine_weights, outputs)
-
-
-class NestedCombine(nn.Module):
-    """
-    Combine the output of the experts.
-    """
-
-    def __init__(self, dtype: torch.dtype = torch.float32):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.zeros((1,), dtype=dtype))
-        self.dtype = dtype
-
-    def forward(
-        self,
-        z: torch.Tensor,
-        router_probs: torch.Tensor,
-        z_prime: torch.Tensor = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            z: Output of attention layer.
-            z_prime: Output of feedforward layer.
-            router_probs: Probabilities assigned by the router.
-        """
-        if z_prime is None:
-            z_prime = 0.0
-        return z + (self.alpha * router_probs + 1) * z_prime
-
-
-def compute_capacity_distribution(E, e_c, delta=2.0, beta=10.0):
+def compute_capacity_distribution(
+    E, e_c, delta=2.0, beta=10.0, device: Optional[torch.device] = None
+):
     """
     Solve the capacity distribution optimization problem:
 
@@ -393,7 +372,7 @@ def compute_capacity_distribution(E, e_c, delta=2.0, beta=10.0):
     if not result.success:
         raise ValueError("Optimization did not converge: " + result.message)
 
-    return result.x
+    return torch.tensor(result.x, device=device)
 
 
 def _exponential_annealing(

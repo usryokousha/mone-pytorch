@@ -19,9 +19,7 @@ class AttentionPooling(nn.Module):
         qk_norm: bool = True,
         proj_bias: bool = True,
         drop_rate: float = 0.0,
-        mlp_ratio: float = 4.0,
         norm_layer: Optional[nn.Module] = nn.LayerNorm,
-        mlp_layer: Optional[nn.Module] = None,
         post_norm: bool = False,
     ):
         super().__init__()
@@ -42,10 +40,6 @@ class AttentionPooling(nn.Module):
         
         self.scale = self.head_dim**-0.5
         self.drop = nn.Dropout(drop_rate)
-        if mlp_layer is not None:
-            self.mlp = mlp_layer(dim, mlp_ratio=mlp_ratio, drop_rate=drop_rate)
-        else:
-            self.mlp = None
         if post_norm:
             self.norm = norm_layer(dim) if norm_layer is not None else nn.Identity()
         else:
@@ -69,9 +63,4 @@ class AttentionPooling(nn.Module):
         x = x.transpose(1, 2).reshape(B, self.latent_size, self.dim)
         x = self.proj(x)
         x = self.drop(x)
-        x = self.norm(x)
-        if self.mlp is not None:
-            x = x + self.mlp(x)
-        if self.latent_size > 1:
-            x = x.mean(dim=1)
         return x

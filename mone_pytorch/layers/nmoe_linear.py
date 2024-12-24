@@ -215,9 +215,14 @@ class ExpertsChooseMaskedContract(nn.Module):
         # Expert bias preparation (M,) -> (E, O)
         return self.linear.bias.reshape(self.num_experts, self.expert_out_features)
 
-    def forward(self, x: torch.Tensor, dispatch_mask: torch.Tensor) -> torch.Tensor:
-        # Combined einsum operation: (bt...,btec,eoi->beco)
-        expert_outputs = torch.einsum("bt...,btec,eoi->beco", x, dispatch_mask, self.weight)
+    def forward(self, x: torch.Tensor, dispatch_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Deal with case where there is no dispatch of experts
+        if dispatch_mask is not None:
+            # Combined einsum operation: (bt...,btec,eoi->beco)
+            expert_outputs = torch.einsum("bt...,btec,eoi->beco", x, dispatch_mask, self.weight)
+        else:
+            # Combined einsum operation: (bt...,eoi->beto)
+            expert_outputs = torch.einsum("bt...,eoi->beto", x, self.weight)
         if self.bias is not None:
             expert_outputs = expert_outputs + self.bias.unsqueeze(0).unsqueeze(2)
         return expert_outputs
@@ -246,7 +251,11 @@ class ExpertsChooseMaskedExpand(nn.Module):
     def bias(self):
         return self.linear.bias
 
-    def forward(self, x: torch.Tensor, combine_array: torch.Tensor, dispatch_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, 
+                x: torch.Tensor, 
+                combine_array: torch.Tensor, 
+                dispatch_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Deal with case where there is no contract layer
         if dispatch_mask is not None:
             x = x.reshape(x.shape[0], -1, self.num_experts, self.expert_in_features)
             x = torch.einsum("btei,btec->beci", x, dispatch_mask)
@@ -266,21 +275,25 @@ class ExpertsChooseMaskedExpand(nn.Module):
             return torch.einsum("beci,eoi,btec->bt...", x, self.weight, combine_array)
 
 
-class ExpertsChooseMLP(nn.Module):
+class ExpertsChooseMlp(nn.Module):
     def __init__(
         self,
         in_features: int,
-        out_features: int,
-        num_experts: int,
+        mlp_ratio: float = 0.5,
+        out_features: Optional[int] = None,
+        num_experts: int = 4,
         bias: bool = True,
         activation: nn.Module = nn.GELU(),
     ):
         super().__init__()
+        if out_features is None:
+            out_features = in_features
+        hidden_features = int(out_features * mlp_ratio)
         self.expert_choose_contract = ExpertsChooseContract(
-            in_features, out_features, num_experts, bias
+            in_features, hidden_features, num_experts, bias
         )
         self.expert_choose_expand = ExpertsChooseExpand(
-            in_features, out_features, num_experts, bias
+            hidden_features, out_features, num_experts, bias
         )
         self.activation = activation
 
@@ -298,26 +311,33 @@ class ExpertsChooseMLP(nn.Module):
         )
 
 
-class ExpertsChooseMaskedMLP(nn.Module):
+class ExpertsChooseMaskedMlp(nn.Module):
     def __init__(
         self,
         in_features: int,
-        out_features: int,
-        num_experts: int,
+        mlp_ratio: float = 0.5,
+        out_features: Optional[int] = None,
+        num_experts: int = 4,
         bias: bool = True,
         activation: nn.Module = nn.GELU(),
     ):
         super().__init__()
+        if out_features is None:
+            out_features = in_features
+        hidden_features = int(out_features * mlp_ratio)
         self.expert_choose_contract = ExpertsChooseMaskedContract(
-            in_features, out_features, num_experts, bias
+            in_features, hidden_features, num_experts, bias
         )
         self.expert_choose_expand = ExpertsChooseMaskedExpand(
-            in_features, out_features, num_experts, bias
+            hidden_features, out_features, num_experts, bias
         )
         self.activation = activation
 
     def forward(
-        self, x: torch.Tensor, dispatch_mask: torch.Tensor, combine_array: torch.Tensor
+        self, 
+        x: torch.Tensor, 
+        combine_array: torch.Tensor, 
+        dispatch_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         x_expert = self.expert_choose_contract(x, dispatch_mask)
         x_expert = self.activation(x_expert)
@@ -398,8 +418,8 @@ if __name__ == "__main__":
     import time
     import triton
 
-    capacity = 50
-    num_experts = 4
+    capacity = 25
+    num_experts = 8
     embed_dim = 768
     contract_dim = 768
     expand_dim = embed_dim
@@ -549,13 +569,13 @@ if __name__ == "__main__":
     dispatch_mask, combine_array = masked_router(x, c=capacity)
 
     # Test masked MLP
-    masked_mlp = ExpertsChooseMaskedMLP(embed_dim, embed_dim, num_experts).cuda()
-    masked_mlp_runtime = triton_benchmark(masked_mlp, (x, dispatch_mask, combine_array))
+    masked_mlp = ExpertsChooseMaskedMlp(embed_dim, mlp_ratio=4, num_experts=num_experts).cuda()
+    masked_mlp_runtime = triton_benchmark(masked_mlp, (x, combine_array, dispatch_mask))
     print(f"Masked MLP latency: {masked_mlp_runtime:.4f} ms.")
 
     # Test masked MLP performance
     masked_mlp_latency, masked_mlp_peak = benchmark_function(
-        masked_mlp, (x, dispatch_mask, combine_array)
+        masked_mlp, (x, combine_array, dispatch_mask)
     )
     print(
         f"Masked MLP latency: {masked_mlp_latency:.4f} ms, peak memory: {masked_mlp_peak:.4f} GB"
@@ -576,7 +596,7 @@ if __name__ == "__main__":
     expert_gate, expert_indices = router(x, c=capacity)
 
     # Test sparse MLP
-    sparse_mlp = ExpertsChooseMLP(embed_dim, embed_dim, num_experts).cuda()
+    sparse_mlp = ExpertsChooseMlp(embed_dim, mlp_ratio=4, num_experts=num_experts).cuda()
     sparse_mlp_runtime = triton_benchmark(
         sparse_mlp, (x, expert_indices, expert_gate, x.shape[1])
     )

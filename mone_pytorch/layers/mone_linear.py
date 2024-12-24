@@ -4,9 +4,6 @@ import torch.nn.functional as F
 
 from typing import Optional, Callable
 
-def _check_nested_linear(expert_mask: torch.Tensor, num_experts: int) -> bool:
-    return expert_mask is not None and num_experts > 1
-
 class NestedLinearExpand(nn.Linear):
     """Performs a linear projection expansion with a nested expert mask"""
     def __init__(
@@ -62,9 +59,6 @@ def nested_linear_expand(
     out_dim = w.shape[0]
     input_shape = x.shape
     batch_seq = x.shape[:-1].numel()
-
-    if torch.all(expert_mask == num_experts - 1):
-        return F.linear(x, w, b)
 
     # Reshape input and pad to output dimension
     x = x.reshape(batch_seq, in_dim)
@@ -137,6 +131,8 @@ def nested_mlp(
     expert_mask: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
+    ln_weight: torch.Tensor = None,
+    ln_bias: torch.Tensor = None,
     activation: Callable = F.gelu,
     drop_rate: float = 0.0,
     num_experts: int = 4,
@@ -145,6 +141,7 @@ def nested_mlp(
     """More efficient implementation of nested MLP"""
     in_dim = w1.shape[1]
     out_dim = w2.shape[0]
+    hidden_dim = w1.shape[0]
     input_shape = x.shape
     batch_seq = x.shape[:-1].numel()
 
@@ -165,6 +162,8 @@ def nested_mlp(
         x_m = F.linear(x_m, w_m, b1)
         x_m = activation(x_m)
         x_m = F.dropout(x_m, drop_rate, training)
+        if ln_weight is not None:
+            x_m = F.layer_norm(x_m, (hidden_dim,), ln_weight, ln_bias)
         w_m = w2[:D_m_out, :]
         if b2 is not None:
             b_m = b2[:D_m_out]
@@ -183,11 +182,14 @@ def nested_swiglu_mlp(
     expert_mask: torch.Tensor,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
+    ln_weight: torch.Tensor = None,
+    ln_bias: torch.Tensor = None,
     num_experts: int = 4,
 ) -> torch.Tensor:
     """More efficient implementation of nested MLP with SwiGLU"""
     in_dim = w1.shape[1]
     out_dim = w2.shape[0]
+    hidden_dim = w1.shape[0]
     input_shape = x.shape
     batch_seq = x.shape[:-1].numel()
 
@@ -209,7 +211,8 @@ def nested_swiglu_mlp(
         x_m = F.linear(x_m, w_m, b1)
         x1, x2 = x_m.chunk(2, dim=-1)
         x_m = x1 * F.silu(x2)
-
+        if ln_weight is not None:
+            x_m = F.layer_norm(x_m, (hidden_dim,), ln_weight, ln_bias)
         w_m = w2[:D_m_out, :]
         if b2 is not None:
             b_m = b2[:D_m_out]
@@ -225,7 +228,6 @@ def nested_swiglu_mlp(
 if __name__ == "__main__":
     import os
 
-    os.environ["TORCH_CUDNN_V9_API_ENABLED"] = "1"
     x = torch.randn(256, 100, 768, dtype=torch.float32).cuda()
     w = torch.randn(768, 768, dtype=torch.float32).cuda()
     expert_mask = torch.zeros(256, 100, dtype=torch.int64).cuda()

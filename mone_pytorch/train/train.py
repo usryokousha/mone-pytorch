@@ -1,362 +1,478 @@
+import os
+import math
+import json
+import time
+from collections import OrderedDict
+from typing import Collection, Optional, Tuple, Union, Callable
+from argparse import Namespace
+import heapq
+from pathlib import Path
+
 import hydra
 from omegaconf import DictConfig, OmegaConf
+
 import torch
-from lightning.fabric import Fabric, seed_everything
-from torchmetrics import MetricCollection, Accuracy, Precision
-from torch.optim.swa_utils import get_ema_multi_avg_fn, AveragedModel
-from mone_pytorch.utils.flops import profile_fvcore
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.optim import swa_utils
+from torch.optim.lr_scheduler import LambdaLR
+from lightning.fabric import Fabric
+from lightning.fabric.loggers import CSVLogger
+from wandb.integration.lightning.fabric import WandbLogger
 
 from mone_pytorch.data.dataloader import build_dataloaders
-from mone_pytorch.models.vit import build_vit
-from mone_pytorch.utils.optimizer import build_optimizer
-from mone_pytorch.layers.routing import CapacityScheduler, compute_capacity_distribution
-from mone_pytorch.utils.augmentation import CutMixup
+from mone_pytorch.data.augmentation import CutMixup
+from mone_pytorch.models import build_model
+from utils import (
+    accuracy,
+    AverageMeter,
+    create_scheduler,
+    create_optimizer,
+)
 
-from typing import Optional
 
 def train_one_epoch(
     fabric: Fabric,
-    model: torch.nn.Module,
-    ema_model: torch.nn.Module,
-    train_loader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler._LRScheduler,
-    metrics: MetricCollection,
-    cfg: DictConfig,
     epoch: int,
-    capacity_distribution: Optional[torch.Tensor] = None,
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: Callable,
+    cfg: DictConfig,
+    lr_scheduler: Optional[LambdaLR] = None,
+    model_ema: Optional[swa_utils.AveragedModel] = None,
+    mixup_fn: Optional[CutMixup] = None,
 ):
+    update_time_m = AverageMeter()
+    data_time_m = AverageMeter()
+    losses_m = AverageMeter()
+
     model.train()
-    cutmixup = CutMixup(
-        cutmix_alpha=cfg.augmentation.cutmix.alpha,
-        mixup_alpha=cfg.augmentation.mixup.alpha,
-        num_classes=cfg.model.num_classes,
-    )
 
-    for batch_idx, (images, targets) in enumerate(train_loader):
-        with fabric.no_backward_sync(
-            model,
-            enabled=(batch_idx + 1) % cfg.training.gradient_accumulation != 0,
-        ):
-            # Apply mixup/cutmix transforms
-            images, targets = cutmixup(images, targets)
-            outputs = model(images, c=capacity_distribution.to(fabric.device))
+    accum_steps = cfg.train.grad_accum_steps
+    last_accum_steps = len(loader) % accum_steps
+    updates_per_epoch = (len(loader) + accum_steps - 1) // accum_steps
+    num_updates = epoch * updates_per_epoch
+    last_batch_idx = len(loader) - 1
+    last_batch_idx_to_accum = len(loader) - last_accum_steps
 
-            loss = torch.nn.functional.cross_entropy(
-                outputs, targets, label_smoothing=cfg.augmentation.label_smoothing
-            )
+    data_start_time = update_start_time = time.time()
+    optimizer.zero_grad()
+    update_sample_count = 0
+
+    for batch_idx, (input, target) in enumerate(loader):
+        last_batch = batch_idx == last_batch_idx
+        need_update = last_batch or (batch_idx + 1) % accum_steps == 0
+        update_idx = batch_idx // accum_steps
+        if batch_idx >= last_batch_idx_to_accum:
+            accum_steps = last_accum_steps
+
+        if mixup_fn is not None:
+            input, target = mixup_fn(input, target)
+
+        data_time_m.update(accum_steps * (time.time() - data_start_time))
+
+        with fabric.no_backward_sync(model, enabled=not need_update):
+            output = model(input)
+            loss = loss_fn(output, target)
+            if accum_steps > 1:
+                loss = loss / accum_steps
 
             fabric.backward(loss)
 
-        # Update metrics for every batch, not just after accumulation
-        metrics.update(outputs.detach(), targets)
-
-        # Only update optimizer when gradient accumulation is complete
-        if (batch_idx + 1) % cfg.training.gradient_accumulation == 0:
-            if hasattr(cfg.training, "grad_clip"):
-                fabric.clip_gradients(model, optimizer, max_norm=cfg.training.grad_clip)
-
+        if need_update:
+            if cfg.train.clip_grad is not None:
+                fabric.clip_gradients(
+                    model,
+                    optimizer,
+                    max_norm=cfg.train.clip_grad,
+                    mode=cfg.train.clip_mode,
+                )
             optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
 
-            if cfg.training.ema.enabled and epoch >= cfg.training.ema.start_epoch:
-                if batch_idx % cfg.training.ema.update_interval == 0:
-                    ema_model.update_parameters(model.module)
+        losses_m.update(loss.item() * accum_steps, input.size(0))
+        update_sample_count += input.size(0)
 
-        # Only print when we complete a gradient accumulation step AND it's a 10th effective batch
-        if (
-            batch_idx + 1
-        ) % cfg.training.gradient_accumulation == 0:  # Only on accumulation steps
-            effective_batch = batch_idx // cfg.training.gradient_accumulation
-            if fabric.is_global_zero and effective_batch % 10 == 0:
-                total_effective_batches = (
-                    len(train_loader) // cfg.training.gradient_accumulation
-                )
+        if not need_update:
+            data_start_time = time.time()
+            continue
+
+        num_updates += 1
+        if model_ema is not None:
+            model_ema.update_parameters(model.module)
+
+        time_now = time.time()
+        update_time_m.update(time.time() - update_start_time)
+        update_start_time = time_now
+
+        if update_idx % cfg.train.log_interval == 0:
+            lrl = [param_group["lr"] for param_group in optimizer.param_groups]
+            lr = sum(lrl) / len(lrl)
+
+            loss_avg, loss_now = losses_m.avg, losses_m.val
+            update_sample_count = update_sample_count * fabric.world_size
+
+            if fabric.is_global_zero:
                 fabric.print(
-                    f"Epoch: {epoch} | Effective Batch: {effective_batch}/{total_effective_batches} "
-                    f"| Loss: {loss.item():.4f}"
+                    f"Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} "
+                    f"({100. * (update_idx + 1) / updates_per_epoch:>3.0f}%)]  "
+                    f"Loss: {loss_now:#.3g} ({loss_avg:#.3g})  "
+                    f"Time: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s  "
+                    f"({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  "
+                    f"LR: {lr:.3e}  "
+                    f"Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})"
                 )
 
-            # Log training metrics (moved inside gradient accumulation check)
-            if (effective_batch + 1) % cfg.training.logging.interval == 0:
-                # Adjust global step to account for gradient accumulation
-                global_step = (
-                    epoch * len(train_loader) + batch_idx
-                ) // cfg.training.gradient_accumulation
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
-                metrics_dict = metrics.compute()
-                metrics_dict["train/learning_rate"] = scheduler.get_last_lr()[0]
-                metrics_dict["train/loss"] = loss.detach()
+        update_sample_count = 0
+        data_start_time = time.time()
 
-                fabric.log_dict(metrics_dict, step=global_step)
-
-                # Reset metrics after logging
-                metrics.reset()
+    return OrderedDict([("loss", losses_m.avg, "lr", lr_scheduler.get_last_lr())])
 
 
 def validate(
     fabric: Fabric,
-    model: torch.nn.Module,
-    val_loader,
-    metrics: MetricCollection,
-    cfg: DictConfig,
-    epoch: int,
-    capacity_distribution: Optional[torch.Tensor] = None,
+    model: nn.Module,
+    loader: DataLoader,
+    loss_fn: Callable,
+    args: Namespace,
 ):
-    """Run validation loop and log metrics."""
+    batch_time_m = AverageMeter()
+    losses_m = AverageMeter()
+    top1_m = AverageMeter()
+    top5_m = AverageMeter()
+
     model.eval()
-    if capacity_distribution is not None:
-        capacity_distribution = torch.tensor(
-            [0.0] * (cfg.mone.num_experts - 1) + [1.0], 
-            dtype=torch.float32,
-        )
+
+    end = time.time()
+    last_idx = len(loader) - 1
     with torch.no_grad():
-        for images, targets in val_loader:
-            outputs = model(images, c=capacity_distribution.to(fabric.device))
-            loss = torch.nn.functional.cross_entropy(outputs, targets)
+        for batch_idx, (input, target) in enumerate(loader):
+            last_batch = batch_idx == last_idx
 
-            # Update validation metrics
-            metrics.update(outputs.detach(), targets)
+            output = model(input)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
 
-    # Compute and log validation metrics
-    metrics_dict = metrics.compute()
-    metrics_dict["val/loss"] = loss.detach()
+            loss = loss_fn(output, target)
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
-    if fabric.is_global_zero:
-        fabric.print(
-            f"Validation Results - Epoch: {epoch}\n"
-            f"Top-1 Accuracy: {metrics_dict['val/acc/top1']:.2f}%\n"
-            f"Top-5 Accuracy: {metrics_dict['val/acc/top5']:.2f}%\n"
-            f"Precision: {metrics_dict['val/prec/top1']:.2f}%\n"
-            f"Loss: {metrics_dict['val/loss']:.4f}"
+            losses_m.update(loss.item(), input.size(0))
+            top1_m.update(acc1.item(), output.size(0))
+            top5_m.update(acc5.item(), output.size(0))
+
+            batch_time_m.update(time.time() - end)
+            end = time.time()
+
+            if fabric.is_global_zero and (
+                last_batch or batch_idx % args.log_interval == 0
+            ):
+                fabric.print(
+                    f"Test: [{batch_idx:>4d}/{last_idx}]  "
+                    f"Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})  "
+                    f"Loss: {losses_m.val:>7.3f} ({losses_m.avg:>6.3f})  "
+                    f"Acc@1: {top1_m.val:>7.3f} ({top1_m.avg:>7.3f})  "
+                    f"Acc@5: {top5_m.val:>7.3f} ({top5_m.avg:>7.3f})"
+                )
+
+    metrics = OrderedDict(
+        [("loss", losses_m.avg), ("top1", top1_m.avg), ("top5", top5_m.avg)]
+    )
+
+    # Synchronize metrics across processes
+    if fabric.world_size > 1:
+        metrics = {k: v.item() for k, v in metrics.items()}
+
+    return metrics
+
+
+class CheckpointManager:
+    def __init__(self, save_dir: str, topk: int = 10):
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.topk = topk
+        self.best_checkpoints = []  # Will store tuples of (metric, epoch, filename)
+
+    def save_checkpoint(
+        self, fabric: Fabric, state_dict: dict, metric: float, epoch: int
+    ):
+        filename = f"epoch_{epoch}_acc_{metric:.3f}.pth"
+        save_path = self.save_dir / filename
+
+        # Save the new checkpoint
+        fabric.save(save_path, state_dict)
+
+        # Add to best checkpoints (negative metric for max-heap of top-k best values)
+        heapq.heappush(self.best_checkpoints, (-metric, epoch, str(save_path)))
+
+        # Remove excess checkpoints
+        while len(self.best_checkpoints) > self.topk:
+            _, _, filepath_to_remove = heapq.heappop(self.best_checkpoints)
+            try:
+                Path(filepath_to_remove).unlink()  # Delete the file
+            except FileNotFoundError:
+                pass
+
+    def get_topk_checkpoints(self):
+        return heapq.nlargest(self.topk, self.best_checkpoints)
+
+
+class LinearDecayScheduler:
+    def __init__(
+        self, 
+        start_value: float, 
+        end_value: float, 
+        warmup_steps: int, 
+        total_steps: int,
+        step_size: int = 10
+    ):
+        self.start_value = start_value
+        self.end_value = end_value
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.step_size = step_size
+        
+    def state_dict(self):
+        """Returns the state of the scheduler as a :class:`dict`."""
+        return {
+            'start_value': self.start_value,
+            'end_value': self.end_value,
+            'warmup_steps': self.warmup_steps,
+            'total_steps': self.total_steps,
+            'current_step': self.current_step,
+            'step_size': self.step_size
+        }
+
+    def load_state_dict(self, state_dict):
+        """Loads the scheduler state.
+        
+        Args:
+            state_dict (dict): scheduler state. Should be an object returned
+                from a call to :meth:`state_dict`.
+        """
+        self.__dict__.update(state_dict)
+        
+    def step(self):
+        self.current_step += 1
+        if self.current_step < self.warmup_steps:
+            return self.start_value
+        # Calculate linear decay value and round to next multiple of step_size
+        linear_value = self.start_value - (self.start_value - self.end_value) * (
+            (self.current_step - self.warmup_steps)
+            / (self.total_steps - self.warmup_steps)
         )
-
-    fabric.log_dict(metrics_dict, step=epoch)
-
-    # Reset validation metrics
-    metrics.reset()
-
-    return metrics_dict
+        return math.ceil(linear_value / self.step_size) * self.step_size
 
 
-@hydra.main(config_path="../configs", config_name="config.yaml", version_base="1.3")
+@hydra.main(config_path="configs", config_name="config")
 def main(cfg: DictConfig):
-    # Set seed for reproducibility
-    seed_everything(cfg.seed)
 
-    # log experiment configuration
+    # Set up logging
+    # Pickup from previous Wandb run
     loggers = []
-    if "csv_logger" in cfg.loggers:
-        csv_logger = hydra.utils.instantiate(cfg.loggers.csv_logger)
-        loggers.append(csv_logger)
-    if "wandb" in cfg.loggers:
-        wandb_logger = hydra.utils.instantiate(cfg.loggers.wandb)
-        wandb_logger.experiment.config.update(OmegaConf.to_container(cfg))
-        loggers.append(wandb_logger)
-    if "tensorboard" in cfg.loggers:
-        tensorboard_logger = hydra.utils.instantiate(cfg.loggers.tensorboard)
-        loggers.append(tensorboard_logger)
+    if cfg.logging.wandb.enabled:
+        logger = WandbLogger(
+            project=cfg.wandb.project,
+            save_dir=os.path.join(cfg.train.log_dir, "wandb"),
+            id=cfg.train.checkpoint.id,
+        )
+        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
+        loggers.append(logger)
 
-    # Initialize Fabric with loggers
+    elif cfg.logging.csv.enabled:
+        logger = CSVLogger(save_dir=os.path.join(cfg.train.log_dir, "csv"))
+        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
+        loggers.append(logger)
+
+    # Set up CUDA
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    cfg.train.grad_accum_steps = max(1, cfg.train.grad_accum_steps)
+
+    accelerator = cfg.train.get("accelerator", "auto")
     fabric = Fabric(
-        accelerator="cuda",
-        devices=cfg.training.devices,
-        precision=cfg.training.precision,
-        strategy=cfg.training.strategy,
+        accelerator=accelerator,
+        devices=cfg.train.get("num_gpus", "auto"),
+        precision=cfg.train.get("precision", "bf16-mixed"),
         loggers=loggers,
     )
-    # set accumulation rank for Flora strategy
-    if cfg.training.strategy.startswith("flora"):
-        fabric._strategy.accumulation_rank = cfg.training.accumulation_rank
     fabric.launch()
 
-    # Get dataloaders and augmentation
+    # Indicate what distributed backends is being used
+    fabric.print(f"Distributed backend: {fabric.strategy.__class__.__name__}")
+    fabric.print(f"Using {cfg.train.get('precision', 'bf16-mixed')} precision")
+
+    # Set up model
+    model = build_model(cfg)
+
+    if cfg.train.gradient_checkpointing:
+        model.set_gradient_checkpointing(True)
+
+    nested_name = cfg.nested.get("arch", "vit")
+    fabric.print(f"Model: {cfg.model.name} created with {nested_name}")
+
+    # Set up learning rate
+    if cfg.train.lr is None:
+        global_batch_size = (
+            cfg.train.batch_size * fabric.world_size * cfg.train.grad_accum_steps
+        )
+        batch_ratio = global_batch_size / cfg.train.lr_batch_base
+        cfg.train.lr = cfg.train.lr_base * batch_ratio
+
+    fabric.print(
+        f"Learning rate: {cfg.train.lr} calculated from base learning rate {cfg.train.lr_base}"
+        f" and effective global batch size {global_batch_size} with linear scaling"
+    )
+
+    optimizer = create_optimizer(model, cfg.train.lr, cfg.train.weight_decay)
+
     train_loader, val_loader = build_dataloaders(cfg)
+    fabric.print(
+        f"Created dataloaders with {len(train_loader)} training samples "
+        f"and {len(val_loader)} validation samples"
+    )
 
-    train_steps = len(train_loader) // cfg.training.gradient_accumulation
-    val_steps = len(val_loader)
-    fabric.print(f"Effective training steps / epoch: {train_steps}")
-    fabric.print(f"Effective validation steps / epoch: {val_steps}")
-
-    # Create model with MoNE initialization
-    with fabric.init_module():
-        model = build_vit(
-            block_type=cfg.model.block_type,
-            mlp_type=cfg.model.mlp_type,
-            attention_type=cfg.model.attention_type,
-            **cfg.model.kwargs,
+    # Set up learning rate scheduler
+    if cfg.train.scheduler.enabled:
+        updates_per_epoch = (
+            len(train_loader) + cfg.train.grad_accum_steps - 1
+        ) // cfg.train.grad_accum_steps
+        lr_scheduler = create_scheduler(
+            optimizer,
+            cfg.train.scheduler.num_warmup_epochs,
+            cfg.train.scheduler.num_training_epochs,
+            cfg.train.scheduler.num_cycles,
+            updates_per_epoch,
+        )
+        fabric.print(
+            f"Created LR scheduler with warmup steps {cfg.train.scheduler.num_warmup_epochs} "
+            f"and total steps {cfg.train.scheduler.num_training_epochs}"
         )
 
-    # Create optimizer and scheduler
-    optimizer, scheduler = build_optimizer(cfg, model, fabric)
+    # Set up EMA
+    if cfg.train.ema.enabled:
+        ema_model = swa_utils.AveragedModel(
+            model, multi_avg_fn=swa_utils.get_ema_multi_avg_fn
+        )
+        ema_model.update_parameters(model.module)
+        fabric.print(f"Created EMA model with decay {cfg.train.ema.decay}")
 
-    # Setup with Fabric
+    # Apply torch compile
+    if cfg.train.compile.enabled:
+        model = torch.compile(
+            model, mode=cfg.train.compile.mode, backend=cfg.train.compile.backend
+        )
+        if ema_model is not None:
+            ema_model = torch.compile(
+                ema_model.module,
+                mode=cfg.train.compile.mode,
+                backend=cfg.train.compile.backend,
+            )
+
     model, optimizer = fabric.setup(model, optimizer)
     train_loader, val_loader = fabric.setup_dataloaders(train_loader, val_loader)
 
-    # apply EMA optionally
-    if cfg.training.ema.enabled:
-        ema_avg_fn = get_ema_multi_avg_fn(cfg.training.ema.decay)
-        ema_model = AveragedModel(model.module, avg_fn=ema_avg_fn)
-        fabric.print(f"Using EMA with decay {cfg.training.ema.decay}")
-    else:
-        ema_model = None
+    # Create mixup function
+    mixup_fn = None
+    if cfg.train.mixup.enabled:
+        mixup_fn = CutMixup(
+            mixup_alpha=cfg.train.mixup.mixup_alpha,
+            cutmix_alpha=cfg.train.mixup.cutmix_alpha,
+        )
 
-    # Initialize metrics using ModuleDict and MetricCollection
-    train_metrics = MetricCollection(
-        {
-            "acc/top1": Accuracy(
-                task="multiclass", num_classes=cfg.model.num_classes, top_k=1
-            ),
-            "acc/top5": Accuracy(
-                task="multiclass", num_classes=cfg.model.num_classes, top_k=5
-            ),
-            "prec/top1": Precision(
-                task="multiclass", num_classes=cfg.model.num_classes, top_k=1
-            ),
-        },
-        prefix="train/",
+    # Create loss function
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=cfg.train.label_smoothing).to(
+        fabric.device
     )
-    val_metrics = train_metrics.clone(prefix="val/")
-    train_metrics = train_metrics.to(fabric.device)
-    val_metrics = val_metrics.to(fabric.device)
 
-    # Capacity scheduler
-    if cfg.mone is not None:
-        fabric.print("Using capacity scheduler for MoNE")
-        capacity_scheduler = CapacityScheduler(
-            patch_size=cfg.model.patch_size,
-            image_size=cfg.model.img_size,
-            max_epochs=cfg.training.epochs,
-            min_capacity=cfg.mone.min_capacity,
-            max_capacity=cfg.mone.max_capacity,
-            num_experts=cfg.mone.num_experts,
-            delta=cfg.mone.delta,
-            beta=cfg.mone.beta,
-            annealing_type=cfg.mone.annealing_type,
+    # Create capacity scheduler
+    if cfg.nested.enabled:
+        capacity_scheduler = LinearDecayScheduler(
+            start_value=cfg.nested.capacity.start_value,
+            end_value=cfg.nested.capacity.end_value,
+            warmup_steps=cfg.nested.capacity.warmup_steps,
+            total_steps=cfg.train.epochs,
+            step_size=cfg.nested.capacity.step_size,
         )
 
-    # Handle checkpoint resuming
-    start_epoch = 0
-    if cfg.training.checkpoints.resume_from_checkpoint:
-        checkpoint = fabric.load(cfg.training.checkpoints.resume_from_checkpoint)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        train_metrics.load_state_dict(checkpoint["train_metrics_state_dict"])
-        val_metrics.load_state_dict(checkpoint["val_metrics_state_dict"])
-        if capacity_scheduler is not None:
-            capacity_scheduler.load_state_dict(checkpoint["capacity_scheduler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
+    # Resume from checkpoint
+    start_epoch = None
+    if cfg.train.checkpoint.path:
+        state = {
+            "model": model,
+            "optimizer": optimizer,
+            "ema_model": ema_model,
+            "lr_scheduler": lr_scheduler,
+            "epoch": 0,
+        }
+        fabric.print(f"Resuming from checkpoint {cfg.train.checkpoint.path}")
+        fabric.load(cfg.train.checkpoint.path, state)
+        start_epoch = state["epoch"] + 1
+        fabric.print(f"Resuming from epoch {start_epoch}")
 
-    # print settings
-    fabric.print(f"Training for {cfg.training.epochs} epochs")
-    fabric.print(f"Starting from epoch {start_epoch}")
-    fabric.print(f"Using {cfg.training.precision} precision")
-    fabric.print(f"Using {cfg.training.devices} devices")
+    # Initialize checkpoint manager
+    ckpt_manager = CheckpointManager(
+        save_dir=cfg.train.checkpoint.path,
+        topk=cfg.train.checkpoint.get("keep_topk", 3),
+    )
 
-    if cfg.training.logging.flops:
-        if fabric.is_global_zero:
-            import warnings
-            import logging
+    try:
+        for epoch in range(start_epoch, cfg.train.epochs):
+            # Nested model training
+            if cfg.nested.enabled:
+                model.module.update_capacity()
 
-            # Suppress fvcore logging
-            logging.getLogger("fvcore").setLevel(logging.ERROR)
-            if cfg.mone is not None:
-                capacity_distribution = torch.tensor(
-                    [0.0] * (cfg.mone.num_experts - 1) + [1.0], 
-                    dtype=torch.float32,
-                    device=fabric.device,
-                )
-                # Suppress warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    _, fca_total, _, aca_total = profile_fvcore(
-                        model,
-                    input_size=(3, cfg.model.img_size, cfg.model.img_size),
-                    input_dtype=torch.bfloat16,
-                )
-            fabric.print("Profiling FLOPs ...")
-            fabric.print(f"MoNE is {["enabled", "disabled"][cfg.mone is None]}")
-            fabric.print(f"FLOPs: {fca_total * 1e-9:.5f} GFLOPs")
-            fabric.print(f"Activation FLOPs: {aca_total * 1e-9:.5f} GFLOPs")
-
-            if cfg.mone is not None:
-                capacity_distribution = compute_capacity_distribution(
-                    e_c=cfg.mone.effective_capacity,
-                    E=cfg.mone.num_experts,
-                    delta=cfg.mone.delta,
-                    beta=cfg.mone.beta
-                )
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    _, fca_total, _, aca_total = profile_fvcore(
-                        model,
-                        input_size=(3, cfg.model.img_size, cfg.model.img_size),
-                        input_dtype=torch.bfloat16,
-                        other_inputs=(capacity_distribution.to(fabric.device),),
-                    )
-                fabric.print("Profiling FLOPs at 50% Effective Capacity ...")
-                fabric.print(f"FLOPs: {fca_total * 1e-9:.5f} GFLOPs")
-                fabric.print(f"Activation FLOPs: {aca_total * 1e-9:.5f} GFLOPs")
-
-    # Training loop
-    for epoch in range(start_epoch, cfg.training.epochs):
-        capacity_distribution = None
-        adjusted_patch_size = None
-        # Update capacity scheduler
-        if capacity_scheduler is not None:
-            if fabric.is_global_zero:
-                fabric.print("Using capacity scheduler for MoNE")
-                capacity_distribution, adjusted_patch_size = capacity_scheduler.update()
-            else:
-                capacity_distribution = torch.zeros(cfg.mone.num_experts)
-                adjusted_patch_size = torch.zeros(1)
-            capacity_distribution = fabric.broadcast(capacity_distribution)
-            adjusted_patch_size = fabric.broadcast(adjusted_patch_size)
-
-            model.module.set_input_size(
-                img_size=cfg.model.img_size,
-                patch_size=adjusted_patch_size.item(),
+            # Train the model
+            train_metrics = train_one_epoch(
+                fabric,
+                epoch,
+                model,
+                train_loader,
+                optimizer,
+                loss_fn,
+                cfg,
+                lr_scheduler,
+                ema_model,
+                mixup_fn,
             )
-        train_one_epoch(
-            fabric=fabric,
-            model=model,
-            ema_model=ema_model,
-            train_loader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            metrics=train_metrics,  # Pass metrics to train_one_epoch
-            cfg=cfg,
-            epoch=epoch,
-            capacity_distribution=capacity_distribution,
-        )
+            fabric.log_dict(train_metrics, step=epoch)
 
-        # Validation
-        if epoch % cfg.training.val_interval == 0:
-            validate(
-                fabric=fabric,
-                model=model,
-                val_loader=val_loader,
-                metrics=val_metrics,
-                epoch=epoch,
-                capacity_distribution=capacity_distribution,
-            )
+            # Validate the model
+            val_metrics = validate(fabric, model, val_loader, loss_fn, cfg)
+            fabric.log_dict(val_metrics, step=epoch)
 
-        # Save checkpoint
-        if fabric.is_global_zero and epoch % cfg.training.save_interval == 0:
-            fabric.save(
-                cfg.training.checkpoints.path / f"epoch_{epoch}.pt",
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "train_metrics_state_dict": train_metrics.state_dict(),
-                    "val_metrics_state_dict": val_metrics.state_dict(),
-                },
-            )
+            # Save checkpoint using the checkpoint manager
+            if epoch % cfg.train.checkpoint.save_interval == 0:
+                ckpt_manager.save_checkpoint(
+                    fabric,
+                    {
+                        "model": model,
+                        "optimizer": optimizer,
+                        "ema_model": ema_model,
+                        "lr_scheduler": lr_scheduler,
+                        "epoch": epoch,
+                    },
+                    val_metrics["top1"],  # Using top1 accuracy as the metric
+                    epoch,
+                )
+
+    except KeyboardInterrupt:
+        pass
+
+    topk_checkpoints = ckpt_manager.get_topk_checkpoints()
+    topk_metrics = {}
+    for metric, epoch, _ in topk_checkpoints:
+        topk_metrics.update({"validation_accuracy": metric, "epoch": epoch})
+
+    fabric.print(
+        "Training finished with top metrics: \n" f"{json.dumps(topk_metrics, indent=4)}"
+    )
 
 
 if __name__ == "__main__":
