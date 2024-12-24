@@ -409,6 +409,7 @@ def main(cfg: DictConfig):
             "optimizer": optimizer,
             "ema_model": ema_model,
             "lr_scheduler": lr_scheduler,
+            "capacity_scheduler": capacity_scheduler,
             "epoch": 0,
         }
         fabric.print(f"Resuming from checkpoint {cfg.train.checkpoint.path}")
@@ -426,7 +427,8 @@ def main(cfg: DictConfig):
         for epoch in range(start_epoch, cfg.train.epochs):
             # Nested model training
             if cfg.nested.enabled:
-                model.module.update_capacity()
+                effective_capacity = capacity_scheduler.step()
+                model.module.update_capacity(effective_capacity)
 
             # Train the model
             train_metrics = train_one_epoch(
