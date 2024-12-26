@@ -174,48 +174,6 @@ class ExpertsChooseMaskedRouter(Router):
         return dispatch_mask, combine_array
 
 
-class ExpertsChooseRouter(Router):
-    """
-    PyTorch implementation of 'experts choose' routing strategy,
-    subclassing the given Router class. This strategy assigns tokens
-    by letting each expert pick its top tokens independently.
-
-    The `_compute_routing_instructions` method returns:
-    - expert_indices: [batch, capacity, num_experts]
-    - expert_gate: [batch, capacity, num_experts]
-
-    Here, 'capacity' is the number of tokens that each expert selects.
-    """
-
-    def compute_routing_instructions(
-        self, router_probs: torch.Tensor, capacity: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute routing instructions using "experts choose" routing.
-
-        Args:
-            router_probs (torch.Tensor): [B, T, E] router probabilities
-                                         B: batch
-                                         T: num_tokens
-                                         E: num_experts
-            capacity (torch.Tensor): scalar tensor indicating the top-k capacity.
-
-        Returns:
-            expert_indices (torch.Tensor): [B, E, C] indices of the chosen experts.
-            expert_gate (torch.Tensor): [B, E, C] probabilities of the chosen experts.
-        """
-        # Ensure capacity is an integer
-        if isinstance(capacity, torch.Tensor):
-            capacity = int(capacity.item())
-
-        expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=1)
-
-        return (
-            expert_gate.permute(0, 2, 1),
-            expert_indices.permute(0, 2, 1),
-        )
-
-
 def normalize(x: torch.Tensor, axis: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """Normalize tensor along dimension to unit norm."""
     m = torch.rsqrt(torch.square(x).sum(axis=axis, keepdim=True) + eps)

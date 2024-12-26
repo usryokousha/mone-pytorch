@@ -92,7 +92,7 @@ class NestedExpertsMlp(Mlp):
         return x
 
 
-class ExpertsChooseMlp(nn.Module):
+class ExpertsChooseMaskedMlp(nn.Module):
     """MLP with experts choice routing"""
 
     def __init__(
