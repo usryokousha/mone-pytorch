@@ -3,8 +3,8 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .mone_linear import nested_mlp
-from .nmoe_linear import (
+from .nested_experts_linear import nested_mlp
+from .experts_choose_linear import (
     ExpertsChooseMaskedContract,
     ExpertsChooseMaskedExpand,
 )

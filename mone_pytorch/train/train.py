@@ -220,54 +220,6 @@ class CheckpointManager:
         return heapq.nlargest(self.topk, self.best_checkpoints)
 
 
-class LinearDecayScheduler:
-    def __init__(
-        self, 
-        start_value: float, 
-        end_value: float, 
-        warmup_steps: int, 
-        total_steps: int,
-        step_size: int = 10
-    ):
-        self.start_value = start_value
-        self.end_value = end_value
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.current_step = 0
-        self.step_size = step_size
-        
-    def state_dict(self):
-        """Returns the state of the scheduler as a :class:`dict`."""
-        return {
-            'start_value': self.start_value,
-            'end_value': self.end_value,
-            'warmup_steps': self.warmup_steps,
-            'total_steps': self.total_steps,
-            'current_step': self.current_step,
-            'step_size': self.step_size
-        }
-
-    def load_state_dict(self, state_dict):
-        """Loads the scheduler state.
-        
-        Args:
-            state_dict (dict): scheduler state. Should be an object returned
-                from a call to :meth:`state_dict`.
-        """
-        self.__dict__.update(state_dict)
-        
-    def step(self):
-        self.current_step += 1
-        if self.current_step < self.warmup_steps:
-            return self.start_value
-        # Calculate linear decay value and round to next multiple of step_size
-        linear_value = self.start_value - (self.start_value - self.end_value) * (
-            (self.current_step - self.warmup_steps)
-            / (self.total_steps - self.warmup_steps)
-        )
-        return math.ceil(linear_value / self.step_size) * self.step_size
-
-
 @hydra.main(config_path="configs", config_name="config")
 def main(cfg: DictConfig):
 
@@ -391,16 +343,6 @@ def main(cfg: DictConfig):
         fabric.device
     )
 
-    # Create capacity scheduler
-    if cfg.nested.enabled:
-        capacity_scheduler = LinearDecayScheduler(
-            start_value=cfg.nested.capacity.start_value,
-            end_value=cfg.nested.capacity.end_value,
-            warmup_steps=cfg.nested.capacity.warmup_steps,
-            total_steps=cfg.train.epochs,
-            step_size=cfg.nested.capacity.step_size,
-        )
-
     # Resume from checkpoint
     start_epoch = None
     if cfg.train.checkpoint.path:
@@ -409,7 +351,6 @@ def main(cfg: DictConfig):
             "optimizer": optimizer,
             "ema_model": ema_model,
             "lr_scheduler": lr_scheduler,
-            "capacity_scheduler": capacity_scheduler,
             "epoch": 0,
         }
         fabric.print(f"Resuming from checkpoint {cfg.train.checkpoint.path}")
@@ -427,7 +368,7 @@ def main(cfg: DictConfig):
         for epoch in range(start_epoch, cfg.train.epochs):
             # Nested model training
             if cfg.nested.enabled:
-                effective_capacity = capacity_scheduler.step()
+                effective_capacity = cfg.nested.effective_capacity
                 model.module.update_capacity(effective_capacity)
 
             # Train the model
