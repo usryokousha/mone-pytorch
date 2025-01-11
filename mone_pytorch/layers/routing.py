@@ -116,6 +116,18 @@ class ExpertPreferredRouter(Router):
         return M, M_probs
 
 
+def _dispatch(data: torch.Tensor) -> torch.Tensor:
+    """Reshapes data for F.linear"""
+    B, C = data.shape[:2]
+    return data.reshape(B, C, -1)
+
+
+def _receive(data: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Reshapes data from F.linear"""
+    B, C, D  = data.shape
+    return data.reshape(B, C, num_experts, D // num_experts)
+
+@torch.compile
 class ExpertsChooseMaskedRouter(Router):
     """
     PyTorch implementation of 'experts choose' routing strategy,
@@ -156,10 +168,7 @@ class ExpertsChooseMaskedRouter(Router):
         # transpose router_probs to [B, E, T]
         router_probs = router_probs.permute(0, 2, 1)
 
-        if capacity == T:
-            # If full capacity we don't need to dispatch experts [B, T, E, C]
-            return None, router_probs.unsqueeze(-1)
-
+        # expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=-1)
         expert_gate, expert_indices = torch.topk(router_probs, k=capacity, dim=-1)
 
         # Create a one-hot dispatch mask of shape [B, E, C, T]
@@ -172,12 +181,24 @@ class ExpertsChooseMaskedRouter(Router):
         combine_array = torch.einsum("...ec,...tec->...tec", expert_gate, dispatch_mask)
 
         return dispatch_mask, combine_array
+    
+    @staticmethod
+    def dispatch(data: torch.Tensor, dispatch_weights: torch.Tensor) -> torch.Tensor:
+        """Dispatch the inputs to the experts."""
+        return torch.einsum("bt...,btec->bec...", data, dispatch_weights)
+    
+    @staticmethod
+    def combine(data: torch.Tensor, combine_weights: torch.Tensor) -> torch.Tensor:
+        """Combine the inputs from the experts."""
+        return torch.einsum("bec...,btec->bt...", data, combine_weights)
 
 
 def normalize(x: torch.Tensor, axis: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """Normalize tensor along dimension to unit norm."""
     m = torch.rsqrt(torch.square(x).sum(axis=axis, keepdim=True) + eps)
     return x * m
+
+
 
 
 class SoftMergingRouter(nn.Module):
@@ -259,6 +280,16 @@ class SoftMergingRouter(nn.Module):
             combine_weights = F.softmax(logits, dim=(2, 3))
 
         return dispatch_weights, combine_weights
+
+    @staticmethod
+    def dispatch(data: torch.Tensor, dispatch_weights: torch.Tensor) -> torch.Tensor:
+        """Dispatch the inputs to the experts."""
+        return _dispatch(torch.einsum("bt...,btec->bec...", data, dispatch_weights))
+    
+    @staticmethod
+    def combine(data: torch.Tensor, combine_weights: torch.Tensor) -> torch.Tensor:
+        """Combine the inputs from the experts."""
+        return _receive(torch.einsum("bec...,btec->bt...", data, combine_weights))
 
 
 def compute_capacity_distribution(
